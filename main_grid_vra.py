@@ -1,17 +1,18 @@
 import geopandas as gpd
 import numpy as np
 import pandas as pd
-from shapely.geometry import Polygon
+from shapely.geometry import Polygon, Point
 from shapely import affinity
 import math
 import os
 import glob
 import xml.etree.ElementTree as ET
+import re
 
 from fertilizer_calculator import FertilizerCalculator
 
 # ======================================================
-# 0. 환경 설정 (사용자 입력)
+# 0. 환경 설정
 # ======================================================
 DATA_FOLDER = "test_data"
 RESULT_ROOT = "result"
@@ -78,6 +79,27 @@ def export_isoxml(gdf, output_folder, task_name, rate_col='F_Need_10a'):
     return xml_path
 
 
+def fix_coordinate_system(gdf, tag):
+    if gdf.crs is None:
+        print(f"  [보정] '{tag}' 좌표계가 정의되지 않아 EPSG:4326(위경도)로 설정합니다.")
+        gdf.crs = "EPSG:4326"
+
+    bounds = gdf.total_bounds
+    mean_x = (bounds[0] + bounds[2]) / 2
+    mean_y = (bounds[1] + bounds[3]) / 2
+
+    if (30 < mean_x < 45) and (120 < mean_y < 135):
+        print(f"  [!!! 좌표보정 !!!] '{tag}' 데이터의 위도/경도가 반대로 되어있습니다. (Swap 실행)")
+        gdf['geometry'] = gdf['geometry'].apply(lambda p: Point(p.y, p.x) if p.geom_type == 'Point' else p)
+
+    try:
+        gdf_meter = gdf.to_crs(epsg=5179)
+        return gdf_meter
+    except Exception as e:
+        print(f"  [오류] 좌표 변환 실패: {e}")
+        return None
+
+
 def process_single_field(soil_path, boundary_path, base_name):
     print(f"\n>>> [처리 시작] {base_name}")
     try:
@@ -86,54 +108,75 @@ def process_single_field(soil_path, boundary_path, base_name):
         bound_input = f"zip://{boundary_path}".replace("\\", "/") if not boundary_path.startswith(
             "zip://") else boundary_path.replace("\\", "/")
 
-        points_gdf = gpd.read_file(soil_input)
+        # 파일 읽기
+        points_gdf = None
+        encodings_to_try = ['euc-kr', 'cp949', 'latin1', 'utf-8']
+        for enc in encodings_to_try:
+            try:
+                points_gdf = gpd.read_file(soil_input, encoding=enc)
+                break
+            except:
+                continue
+        if points_gdf is None: points_gdf = gpd.read_file(soil_input)
         boundary_gdf = gpd.read_file(bound_input)
 
-        if points_gdf.crs is None: points_gdf.crs = "EPSG:4326"
-        if boundary_gdf.crs is None: boundary_gdf.crs = "EPSG:4326"
+        # 좌표계 보정
+        points_meter = fix_coordinate_system(points_gdf, "토양점")
+        boundary_meter = fix_coordinate_system(boundary_gdf, "경계")
 
-        points_meter = points_gdf.to_crs(epsg=5179)
-        boundary_meter = boundary_gdf.to_crs(epsg=5179)
+        if points_meter is None or boundary_meter is None: return
 
         # ------------------------------------------------------------------
-        # [수정] 데이터 전처리 (Ghost Text 제거 및 숫자 강제 변환)
+        # [데이터 정제 강화 (Regex 복구 및 중복 제거)
         # ------------------------------------------------------------------
-        # 1. 컬럼명 대문자화 및 공백 제거
-        points_meter.columns = points_meter.columns.str.strip().str.upper()
+        # 1. 컬럼명 정제
+        new_columns = {}
+        for col in points_meter.columns:
+            clean_col = re.sub(r'[^A-Z0-9]', '', col.upper())
+            new_columns[col] = clean_col
+        points_meter = points_meter.rename(columns=new_columns)
 
-        # [핵심 수정] GEOMETRY 컬럼이 생겼다면 다시 geometry(소문자)로 복구하고 활성화
+        # 중복 컬럼 제거 (같은 이름의 컬럼이 여러 개면 계산 오류 발생)
+        points_meter = points_meter.loc[:, ~points_meter.columns.duplicated()]
+
+        # 2. Geometry 복구
         if 'GEOMETRY' in points_meter.columns:
             points_meter = points_meter.rename(columns={'GEOMETRY': 'geometry'})
+        points_meter = points_meter.set_geometry('geometry')
 
-        points_meter = points_meter.set_geometry('geometry')  # 명시적 활성화
-
-        # 2. 제외할 컬럼 정의 ('geometry'는 소문자로 확인)
         exclude_cols = ['ID', 'LATITUDE', 'LONGITUDE', 'COUNTRATE', 'geometry']
 
-        # 3. 숫자 변환
+        # 3. 숫자 강제 추출 (지난번 pass 버그 수정!)
         for col in points_meter.columns:
             if col not in exclude_cols:
-                points_meter[col] = pd.to_numeric(points_meter[col], errors='coerce').fillna(0)
+                # 1차 시도: 숫자 변환
+                points_meter[col] = pd.to_numeric(points_meter[col], errors='coerce')
 
-        # 4. 분석 대상 컬럼 확정
+                # 2차 시도: NaN이 있다면 Regex로 강제 추출 (데이터가 더러울 경우 대비)
+                if points_meter[col].isnull().sum() > 0:
+                    points_meter[col] = points_meter[col].astype(str).str.extract(r'([-+]?\d*\.?\d+)')
+                    points_meter[col] = pd.to_numeric(points_meter[col], errors='coerce')
+
+                # 최종: 그래도 없으면 0
+                points_meter[col] = points_meter[col].fillna(0)
+
         numeric_cols = points_meter.select_dtypes(include=[np.number]).columns.tolist()
         analysis_cols = [col for col in numeric_cols if col not in exclude_cols]
 
-        # [안전장치] 필수 성분 강제 추가
         for essential in ['OM', 'SI', 'PH', 'P', 'K', 'MG']:
             if essential in points_meter.columns and essential not in analysis_cols:
                 analysis_cols.append(essential)
 
         print(f"  - 분석 대상 성분: {analysis_cols}")
 
+        if 'OM' in points_meter.columns:
+            print(f"  [데이터검증] 로드된 유기물(OM) 평균: {points_meter['OM'].mean():.2f}")
+
     except Exception as e:
-        print(f"[오류] 파일 로드 실패: {e}")
-        # import traceback; traceback.print_exc() # 디버깅용
+        print(f"[오류] 파일 로드/전처리 실패: {e}")
         return
 
-    # ------------------------------------------------------------------
-    # 그리드 생성 및 분석 로직
-    # ------------------------------------------------------------------
+    # 그리드 생성
     boundary_geom = boundary_meter.union_all()
     rotation_angle = get_main_angle(boundary_geom)
     centroid = boundary_geom.centroid
@@ -153,12 +196,27 @@ def process_single_field(soil_path, boundary_path, base_name):
     clipped_grid = gpd.clip(temp_grid, boundary_meter).reset_index(drop=True)
     clipped_grid['grid_id'] = clipped_grid.index + 1
 
+    # [수정] grid_id 타입 강제 통일 (중요!)
+    clipped_grid['grid_id'] = clipped_grid['grid_id'].astype(int)
+
     # 공간 조인
     joined = gpd.sjoin(clipped_grid, points_meter, how="inner", predicate="intersects")
-    grid_stats = joined.groupby('grid_id')[analysis_cols].mean().reset_index()
+    print(f"  - 공간 조인 결과: 총 {len(joined)}개의 토양 점이 매칭되었습니다.")
 
+    # 그리드별 평균 계산
+    grid_stats = joined.groupby('grid_id')[analysis_cols].mean().reset_index()
+    grid_stats['grid_id'] = grid_stats['grid_id'].astype(int)  # 타입 통일
+
+    # 그리드에 데이터 병합
     final_grid = clipped_grid.merge(grid_stats, on='grid_id', how='left')
     final_grid[analysis_cols] = final_grid[analysis_cols].fillna(0)
+
+    # [최종 검증] 계산기로 넘어가기 직전의 데이터 확인
+    if 'OM' in final_grid.columns:
+        final_om_mean = final_grid[final_grid['OM'] > 0]['OM'].mean()
+        print(f"  [최종검증] 계산 직전 그리드 유기물(OM) 평균: {final_om_mean:.2f} (0 제외)")
+        if pd.isna(final_om_mean) or final_om_mean == 0:
+            print("  [!!! 치명적 오류 !!!] 데이터 병합(Merge) 과정에서 유기물 데이터가 유실되었습니다. grid_id 매칭 실패 가능성.")
 
     # 비료량 산출
     calculator = FertilizerCalculator(
@@ -176,13 +234,19 @@ def process_single_field(soil_path, boundary_path, base_name):
     field_result_dir = os.path.join(RESULT_ROOT, base_name)
     os.makedirs(field_result_dir, exist_ok=True)
 
-    final_grid_renamed = final_grid.rename(columns={'F_Need_10a': 'F_RATE', 'F_Total': 'F_KG', 'N_Need_10a': 'N_RATE'})
-    save_cols = ['grid_id', 'Grid_Area', 'N_RATE', 'F_RATE', 'F_KG', 'geometry'] + analysis_cols
+    final_grid_renamed = final_grid.rename(columns={
+        'N_Need_10a': 'N_Need_10a',
+        'N_Total': 'N_Total',
+        'F_Need_10a': 'F_Need_10a',
+        'F_Total': 'F_Total'
+    })
+
+    save_cols = ['grid_id', 'Grid_Area', 'N_Need_10a', 'N_Total', 'F_Need_10a', 'F_Total', 'geometry'] + analysis_cols
     actual_save_cols = [c for c in save_cols if c in final_grid_renamed.columns]
 
     output_shp = os.path.join(field_result_dir, f"{base_name}_Result.shp")
     final_grid_renamed[actual_save_cols].to_file(output_shp, encoding='euc-kr')
-    print(f"  - SHP 저장 완료")
+    print(f"  - SHP 저장 완료: {os.path.basename(output_shp)}")
 
     try:
         isoxml_gdf = final_grid.to_crs(epsg=4326)
