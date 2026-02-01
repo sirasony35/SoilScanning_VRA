@@ -1,13 +1,11 @@
 import pandas as pd
 import numpy as np
 
-
 class FertilizerCalculator:
     def __init__(self, gdf, crop_type='rice', target_yield=500, basal_ratio=100,
                  fertilizer_n_content=0.20, soil_texture='식양질', min_n_limit=2.0):
         """
         초기화 함수
-        :param min_n_limit: 계산값이 0일 때 적용할 최소 질소 시비량 (기본값: 2.0kg/10a)
         """
         self.gdf = gdf.copy()
         self.crop_type = crop_type.lower()
@@ -15,22 +13,36 @@ class FertilizerCalculator:
         self.basal_ratio = float(basal_ratio) / 100.0
         self.fertilizer_n_content = float(fertilizer_n_content)
         self.soil_texture = str(soil_texture).strip().replace(" ", "").lower()
-
-        # [신규] 최소 시비량 설정 (0 방지용)
         self.min_n_limit = float(min_n_limit)
 
         if self.fertilizer_n_content <= 0:
             print("  [Calculator] [경고] 비료 질소 함량이 0 이하입니다. 1.0(100%)으로 강제 설정합니다.")
             self.fertilizer_n_content = 1.0
 
+        # [수정] 컬럼 찾기 기능 강화
         self.om_col = self._find_column(['OM', 'Om', 'om', 'OrganicMatter'])
         self.si_col = self._find_column(['Si', 'si', 'SiO2', 'sio2', 'Silicate'])
+
+        # [디버깅] 찾은 컬럼 확인 출력
+        if self.om_col:
+            print(f"  [Calculator] 유기물(OM) 데이터 컬럼 인식됨: '{self.om_col}'")
+        else:
+            print("  [Calculator] [경고] 유기물(OM) 컬럼을 찾을 수 없습니다! 계산 시 0으로 처리됩니다.")
+
         self._check_required_columns()
 
     def _find_column(self, candidates):
-        for col in candidates:
-            if col in self.gdf.columns:
-                return col
+        """
+        데이터프레임에서 후보군(candidates) 중 존재하는 컬럼명을 찾습니다.
+        대소문자 및 공백을 무시하고 비교합니다.
+        """
+        # 데이터프레임의 실제 컬럼들을 정리 (대문자+공백제거)하여 매핑
+        clean_cols = {col.strip().upper(): col for col in self.gdf.columns}
+
+        for candidate in candidates:
+            cand_clean = candidate.strip().upper()
+            if cand_clean in clean_cols:
+                return clean_cols[cand_clean]  # 실제 컬럼명 반환
         return None
 
     def _check_required_columns(self):
@@ -73,38 +85,22 @@ class FertilizerCalculator:
         return 0
 
     def interpolate_missing_data(self):
-        """
-        [수정됨] 0값(데이터 공백)을 이웃 그리드 평균으로 보정
-        - 반복문(loop)을 사용하여 뭉쳐있는 0값들을 순차적으로 채웁니다.
-        """
-        # 최대 5번 반복하여 안쪽 구멍까지 값을 채움
         for i in range(5):
-            zero_indices = self.gdf[self.gdf['N_Need_10a'] <= 0].index  # 0 이하인 값 대상
-
-            if len(zero_indices) == 0:
-                break  # 0인 값이 없으면 중단
+            zero_indices = self.gdf[self.gdf['N_Need_10a'] <= 0].index
+            if len(zero_indices) == 0: break
 
             filled_count = 0
             for idx in zero_indices:
                 current_geom = self.gdf.at[idx, 'geometry']
-                # 맞닿은 이웃 찾기
                 neighbors = self.gdf[self.gdf.geometry.touches(current_geom)]
-                # 유효한(0보다 큰) 이웃 값만 추출
                 valid_vals = neighbors[neighbors['N_Need_10a'] > 0]['N_Need_10a']
 
                 if not valid_vals.empty:
-                    # 이웃 평균으로 대체
                     self.gdf.at[idx, 'N_Need_10a'] = valid_vals.mean()
                     filled_count += 1
-
-            # 더 이상 채워진 게 없으면 중단 (무한루프 방지)
-            if filled_count == 0:
-                break
+            if filled_count == 0: break
 
     def apply_minimum_floor(self):
-        """
-        [신규] 보정 후에도 여전히 0인 값(전체가 0인 경우 등)에 최소 시비량 적용
-        """
         zero_mask = self.gdf['N_Need_10a'] < self.min_n_limit
         count = zero_mask.sum()
         if count > 0:
@@ -131,8 +127,7 @@ class FertilizerCalculator:
         # 3. 보정 (반복 보간법)
         self.interpolate_missing_data()
 
-        # 4. [신규] 최소 시비량 적용 (최후의 수단)
-        # 만약 주변도 다 0이라서 보정이 안 되었다면, 최소값(예: 2kg)을 강제 적용
+        # 4. 최소 시비량 적용
         self.apply_minimum_floor()
 
         # 5. 순수 질소 총량

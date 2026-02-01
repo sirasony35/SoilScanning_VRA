@@ -17,18 +17,15 @@ DATA_FOLDER = "test_data"
 RESULT_ROOT = "result"
 
 # 비료 처방 옵션
-CROP_TYPE = 'soybean'  # 'rice', 'soybean', 'wheat'
-TARGET_YIELD = 500  # 목표 수량 (kg/10a), 벼에만 해당
-BASAL_RATIO = 100  # 밑거름 비율 (%)
-SOIL_TEXTURE = '식양질'  # 토성: '사질', '사양질', '식양질' 등
-
-#최소 질소 시비량 설정 (kg/10a)
-# 계산 결과가 0 또는 이 값보다 작게 나오면 강제로 이 값으로 설정됨 (기계 작동용)
+CROP_TYPE = 'soybean'
+TARGET_YIELD = 500
+BASAL_RATIO = 100
+SOIL_TEXTURE = '식양질'
 MIN_N_REQUIREMENT = 2.0
 
 # 비료 제품 정보
-FERTILIZER_N_CONTENT = 0.20  # 비료 1포대의 질소 함량
-FERTILIZER_BAG_WEIGHT = 20   # 비료 1포대의 무게(kg)
+FERTILIZER_N_CONTENT = 0.20
+FERTILIZER_BAG_WEIGHT = 20
 
 
 # ======================================================
@@ -57,6 +54,7 @@ def export_isoxml(gdf, output_folder, task_name, rate_col='F_Need_10a'):
     root = ET.Element("ISO11783_TaskData", {"VersionMajor": "4", "VersionMinor": "3", "DataTransferOrigin": "1"})
     task = ET.SubElement(root, "TSK", {"TaskDesignator": task_name, "TaskStatus": "1"})
 
+    # mg/m2 단위 변환
     gdf['iso_rate'] = (gdf[rate_col] * 1000).astype(int)
 
     zone_id = 0
@@ -96,14 +94,46 @@ def process_single_field(soil_path, boundary_path, base_name):
 
         points_meter = points_gdf.to_crs(epsg=5179)
         boundary_meter = boundary_gdf.to_crs(epsg=5179)
+
+        # ------------------------------------------------------------------
+        # [수정] 데이터 전처리 (Ghost Text 제거 및 숫자 강제 변환)
+        # ------------------------------------------------------------------
+        # 1. 컬럼명 대문자화 및 공백 제거
+        points_meter.columns = points_meter.columns.str.strip().str.upper()
+
+        # [핵심 수정] GEOMETRY 컬럼이 생겼다면 다시 geometry(소문자)로 복구하고 활성화
+        if 'GEOMETRY' in points_meter.columns:
+            points_meter = points_meter.rename(columns={'GEOMETRY': 'geometry'})
+
+        points_meter = points_meter.set_geometry('geometry')  # 명시적 활성화
+
+        # 2. 제외할 컬럼 정의 ('geometry'는 소문자로 확인)
+        exclude_cols = ['ID', 'LATITUDE', 'LONGITUDE', 'COUNTRATE', 'geometry']
+
+        # 3. 숫자 변환
+        for col in points_meter.columns:
+            if col not in exclude_cols:
+                points_meter[col] = pd.to_numeric(points_meter[col], errors='coerce').fillna(0)
+
+        # 4. 분석 대상 컬럼 확정
+        numeric_cols = points_meter.select_dtypes(include=[np.number]).columns.tolist()
+        analysis_cols = [col for col in numeric_cols if col not in exclude_cols]
+
+        # [안전장치] 필수 성분 강제 추가
+        for essential in ['OM', 'SI', 'PH', 'P', 'K', 'MG']:
+            if essential in points_meter.columns and essential not in analysis_cols:
+                analysis_cols.append(essential)
+
+        print(f"  - 분석 대상 성분: {analysis_cols}")
+
     except Exception as e:
         print(f"[오류] 파일 로드 실패: {e}")
+        # import traceback; traceback.print_exc() # 디버깅용
         return
 
-    exclude_cols = ['Id', 'Latitude', 'Longitude', 'Countrate', 'geometry']
-    numeric_cols = points_meter.select_dtypes(include=[np.number]).columns.tolist()
-    analysis_cols = [col for col in numeric_cols if col not in exclude_cols]
-
+    # ------------------------------------------------------------------
+    # 그리드 생성 및 분석 로직
+    # ------------------------------------------------------------------
     boundary_geom = boundary_meter.union_all()
     rotation_angle = get_main_angle(boundary_geom)
     centroid = boundary_geom.centroid
@@ -123,15 +153,14 @@ def process_single_field(soil_path, boundary_path, base_name):
     clipped_grid = gpd.clip(temp_grid, boundary_meter).reset_index(drop=True)
     clipped_grid['grid_id'] = clipped_grid.index + 1
 
+    # 공간 조인
     joined = gpd.sjoin(clipped_grid, points_meter, how="inner", predicate="intersects")
     grid_stats = joined.groupby('grid_id')[analysis_cols].mean().reset_index()
 
     final_grid = clipped_grid.merge(grid_stats, on='grid_id', how='left')
     final_grid[analysis_cols] = final_grid[analysis_cols].fillna(0)
 
-    # ------------------------------------------------------
-    # 5. 비료량 산출
-    # ------------------------------------------------------
+    # 비료량 산출
     calculator = FertilizerCalculator(
         final_grid,
         crop_type=CROP_TYPE,
@@ -139,18 +168,20 @@ def process_single_field(soil_path, boundary_path, base_name):
         basal_ratio=BASAL_RATIO,
         fertilizer_n_content=FERTILIZER_N_CONTENT,
         soil_texture=SOIL_TEXTURE,
-        min_n_limit=MIN_N_REQUIREMENT  # [신규] 최소 시비량 전달
+        min_n_limit=MIN_N_REQUIREMENT
     )
     final_grid = calculator.execute()
 
-    # 6. 결과 저장
+    # 결과 저장
     field_result_dir = os.path.join(RESULT_ROOT, base_name)
     os.makedirs(field_result_dir, exist_ok=True)
 
-    save_cols = ['grid_id', 'Grid_Area', 'N_Need_10a', 'N_Total', 'F_Need_10a', 'F_Total', 'geometry'] + analysis_cols
+    final_grid_renamed = final_grid.rename(columns={'F_Need_10a': 'F_RATE', 'F_Total': 'F_KG', 'N_Need_10a': 'N_RATE'})
+    save_cols = ['grid_id', 'Grid_Area', 'N_RATE', 'F_RATE', 'F_KG', 'geometry'] + analysis_cols
+    actual_save_cols = [c for c in save_cols if c in final_grid_renamed.columns]
 
     output_shp = os.path.join(field_result_dir, f"{base_name}_Result.shp")
-    final_grid[save_cols].to_file(output_shp, encoding='euc-kr')
+    final_grid_renamed[actual_save_cols].to_file(output_shp, encoding='euc-kr')
     print(f"  - SHP 저장 완료")
 
     try:
