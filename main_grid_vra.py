@@ -18,15 +18,15 @@ DATA_FOLDER = "test_data"
 RESULT_ROOT = "result"
 
 # 비료 처방 옵션
-CROP_TYPE = 'rice'
-TARGET_YIELD = 480
+CROP_TYPE = 'soybean'
+TARGET_YIELD = 500
 BASAL_RATIO = 100
-SOIL_TEXTURE = '식양질' # 논콩
-MIN_N_REQUIREMENT = 2.0 #
+SOIL_TEXTURE = '식양질'
+MIN_N_REQUIREMENT = 2.0
 
 # 비료 제품 정보
-FERTILIZER_N_CONTENT = 0.20 #질소함량
-FERTILIZER_BAG_WEIGHT = 20 # 1포대당 무게
+FERTILIZER_N_CONTENT = 0.20
+FERTILIZER_BAG_WEIGHT = 20
 
 
 # ======================================================
@@ -156,7 +156,6 @@ def process_single_field(soil_path, boundary_path, base_name):
         print(f"[오류] 전처리 실패: {e}")
         return
 
-    # 그리드 생성
     boundary_geom = boundary_meter.union_all()
     rotation_angle = get_main_angle(boundary_geom)
     centroid = boundary_geom.centroid
@@ -172,7 +171,6 @@ def process_single_field(soil_path, boundary_path, base_name):
     clipped_grid = gpd.clip(temp_grid, boundary_meter).reset_index(drop=True)
     clipped_grid['grid_id'] = (clipped_grid.index + 1).astype(int)
 
-    # 공간 조인
     joined = gpd.sjoin(clipped_grid, points_meter, how="inner", predicate="intersects")
     print(f"  - 공간 조인 결과: 총 {len(joined)}개의 토양 점이 매칭되었습니다.")
 
@@ -187,7 +185,6 @@ def process_single_field(soil_path, boundary_path, base_name):
         if len(valid_om) > 0:
             print(f"  [최종검증] 해당 그리드들의 평균 OM: {valid_om.mean():.2f}")
 
-    # 비료량 산출
     calculator = FertilizerCalculator(
         final_grid,
         crop_type=CROP_TYPE,
@@ -199,7 +196,6 @@ def process_single_field(soil_path, boundary_path, base_name):
     )
     final_grid = calculator.execute()
 
-    # 저장
     field_result_dir = os.path.join(RESULT_ROOT, base_name)
     os.makedirs(field_result_dir, exist_ok=True)
     final_grid_renamed = final_grid.rename(columns={
