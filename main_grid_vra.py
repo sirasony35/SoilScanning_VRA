@@ -78,6 +78,74 @@ def export_isoxml(gdf, output_folder, task_name, rate_col='F_Need_10a'):
     return xml_path
 
 
+def export_csv(gdf, output_folder, base_name):
+    """
+    [수정] CSV 내보내기 (경고 해결 & 요청 컬럼만 저장)
+    - 순서: grid_id, F_Need_10a, Center_Lat, Center_Lon, Vertices...
+    - 토양 성분 제외
+    """
+    # 1. 중심점 계산 (미터 좌표계에서 계산하여 정확도 확보)
+    centroids_meter = gdf.geometry.centroid
+    centroids_wgs = centroids_meter.to_crs(epsg=4326)
+
+    # 2. 전체 데이터프레임을 위경도로 변환 (꼭지점 추출용)
+    gdf_wgs = gdf.to_crs(epsg=4326)
+
+    # 3. 중심점 좌표 할당
+    gdf_wgs['Center_Lat'] = centroids_wgs.y
+    gdf_wgs['Center_Lon'] = centroids_wgs.x
+
+    # 4. 꼭지점(Vertices) 추출
+    vertex_data = []
+    max_v = 0
+
+    for idx, row in gdf_wgs.iterrows():
+        geom = row['geometry']
+        if geom.geom_type == 'Polygon':
+            coords = list(geom.exterior.coords)
+            if len(coords) > 1 and coords[0] == coords[-1]:
+                coords = coords[:-1]
+
+            row_dict = {'grid_id': row['grid_id']}
+
+            for i, (lon, lat) in enumerate(coords):
+                row_dict[f'V{i + 1}_Lat'] = lat
+                row_dict[f'V{i + 1}_Lon'] = lon
+
+            if len(coords) > max_v:
+                max_v = len(coords)
+
+            vertex_data.append(row_dict)
+
+    v_df = pd.DataFrame(vertex_data)
+
+    # 5. 데이터 병합
+    out_df = gdf_wgs.drop(columns=['geometry']).merge(v_df, on='grid_id', how='left')
+
+    # 6. 컬럼 정렬 및 필터링 (요청하신 순서대로)
+    # grid_id, F_Need_10a, Center_Lat, Center_Lon
+    base_cols = ['grid_id', 'F_Need_10a', 'Center_Lat', 'Center_Lon']
+
+    # 꼭지점 컬럼 (V1_Lat, V1_Lon ...)
+    v_cols = []
+    for i in range(max_v):
+        v_cols.append(f'V{i + 1}_Lat')
+        v_cols.append(f'V{i + 1}_Lon')
+
+    # 최종 저장할 컬럼 리스트 (토양 성분 제외)
+    final_cols = base_cols + v_cols
+
+    # 실제로 존재하는 컬럼만 선택 (F_Need_10a 등이 있는지 확인)
+    final_cols = [c for c in final_cols if c in out_df.columns]
+
+    out_df = out_df[final_cols]
+
+    # 7. 저장
+    csv_path = os.path.join(output_folder, f"{base_name}_Result.csv")
+    out_df.to_csv(csv_path, index=False, encoding='cp949')
+    print(f"  - CSV 저장 완료: {os.path.basename(csv_path)}")
+
+
 def fix_coordinate_system(gdf, tag):
     if gdf.crs is None:
         print(f"  [보정] '{tag}' 좌표계가 정의되지 않아 EPSG:4326(위경도)로 설정합니다.")
@@ -169,6 +237,8 @@ def process_single_field(soil_path, boundary_path, base_name):
     temp_grid = gpd.GeoDataFrame({'geometry': polygons}, crs="EPSG:5179")
     temp_grid['geometry'] = temp_grid['geometry'].apply(lambda g: affinity.rotate(g, rotation_angle, origin=centroid))
     clipped_grid = gpd.clip(temp_grid, boundary_meter).reset_index(drop=True)
+
+    # Grid ID 통일
     clipped_grid['grid_id'] = (clipped_grid.index + 1).astype(int)
 
     joined = gpd.sjoin(clipped_grid, points_meter, how="inner", predicate="intersects")
@@ -176,6 +246,7 @@ def process_single_field(soil_path, boundary_path, base_name):
 
     grid_stats = joined.groupby('grid_id')[analysis_cols].mean().reset_index()
     grid_stats['grid_id'] = grid_stats['grid_id'].astype(int)
+
     final_grid = clipped_grid.merge(grid_stats, on='grid_id', how='left')
     final_grid[analysis_cols] = final_grid[analysis_cols].fillna(0)
 
@@ -185,6 +256,7 @@ def process_single_field(soil_path, boundary_path, base_name):
         if len(valid_om) > 0:
             print(f"  [최종검증] 해당 그리드들의 평균 OM: {valid_om.mean():.2f}")
 
+    # 계산기 실행
     calculator = FertilizerCalculator(
         final_grid,
         crop_type=CROP_TYPE,
@@ -196,26 +268,35 @@ def process_single_field(soil_path, boundary_path, base_name):
     )
     final_grid = calculator.execute()
 
+    # 결과 저장
     field_result_dir = os.path.join(RESULT_ROOT, base_name)
     os.makedirs(field_result_dir, exist_ok=True)
+
     final_grid_renamed = final_grid.rename(columns={
         'N_Need_10a': 'N_Need_10a',
         'N_Total': 'N_Total',
         'F_Need_10a': 'F_Need_10a',
         'F_Total': 'F_Total'
     })
+
     save_cols = ['grid_id', 'Grid_Area', 'N_Need_10a', 'N_Total', 'F_Need_10a', 'F_Total', 'geometry'] + analysis_cols
     actual_save_cols = [c for c in save_cols if c in final_grid_renamed.columns]
 
+    # 1. SHP 저장
     output_shp = os.path.join(field_result_dir, f"{base_name}_Result.shp")
     final_grid_renamed[actual_save_cols].to_file(output_shp, encoding='euc-kr')
     print(f"  - SHP 저장 완료: {os.path.basename(output_shp)}")
+
+    # 2. CSV 저장 (수정됨)
+    export_csv(final_grid_renamed, field_result_dir, base_name)
+
+    # 3. ISOXML 저장
     try:
         isoxml_gdf = final_grid.to_crs(epsg=4326)
         export_isoxml(isoxml_gdf, field_result_dir, task_name=base_name, rate_col='F_Need_10a')
         print(f"  - ISOXML 저장 완료")
     except Exception as e:
-        print(f"  - ISOXML 오류: {e}")
+        print(f"  - ISOXML 생성 오류: {e}")
 
 
 def find_matching_boundary(soil_file, all_boundary_files):
