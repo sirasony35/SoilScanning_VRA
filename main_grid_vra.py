@@ -80,9 +80,8 @@ def export_isoxml(gdf, output_folder, task_name, rate_col='F_Need_10a'):
 
 def export_csv(gdf, output_folder, base_name):
     """
-    [수정] CSV 내보내기 (경고 해결 & 요청 컬럼만 저장)
-    - 순서: grid_id, F_Need_10a, Center_Lat, Center_Lon, Vertices...
-    - 토양 성분 제외
+    [수정] CSV 내보내기 (F_Total 추가됨)
+    - 순서: grid_id, F_Need_10a, F_Total, Center_Lat, Center_Lon, Vertices...
     """
     # 1. 중심점 계산 (미터 좌표계에서 계산하여 정확도 확보)
     centroids_meter = gdf.geometry.centroid
@@ -122,9 +121,9 @@ def export_csv(gdf, output_folder, base_name):
     # 5. 데이터 병합
     out_df = gdf_wgs.drop(columns=['geometry']).merge(v_df, on='grid_id', how='left')
 
-    # 6. 컬럼 정렬 및 필터링 (요청하신 순서대로)
-    # grid_id, F_Need_10a, Center_Lat, Center_Lon
-    base_cols = ['grid_id', 'F_Need_10a', 'Center_Lat', 'Center_Lon']
+    # 6. 컬럼 정렬 및 필터링 (F_Total 추가)
+    # grid_id, F_Need_10a, F_Total, Center_Lat, Center_Lon 순서
+    base_cols = ['grid_id', 'F_Need_10a', 'F_Total', 'Center_Lat', 'Center_Lon']
 
     # 꼭지점 컬럼 (V1_Lat, V1_Lon ...)
     v_cols = []
@@ -132,10 +131,10 @@ def export_csv(gdf, output_folder, base_name):
         v_cols.append(f'V{i + 1}_Lat')
         v_cols.append(f'V{i + 1}_Lon')
 
-    # 최종 저장할 컬럼 리스트 (토양 성분 제외)
+    # 최종 저장할 컬럼 리스트
     final_cols = base_cols + v_cols
 
-    # 실제로 존재하는 컬럼만 선택 (F_Need_10a 등이 있는지 확인)
+    # 실제로 존재하는 컬럼만 선택
     final_cols = [c for c in final_cols if c in out_df.columns]
 
     out_df = out_df[final_cols]
