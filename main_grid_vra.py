@@ -9,6 +9,16 @@ import glob
 import xml.etree.ElementTree as ET
 import re
 
+# [필수] Rasterio 라이브러리 (DJI Tiff 생성용)
+try:
+    import rasterio
+    from rasterio.transform import from_origin
+    from rasterio.features import rasterize
+    from rasterio.warp import calculate_default_transform, reproject, Resampling
+except ImportError:
+    print("[경고] 'rasterio' 라이브러리가 없습니다. DJI 처방맵 생성을 위해 'pip install rasterio'를 설치해주세요.")
+    rasterio = None
+
 from fertilizer_calculator import FertilizerCalculator
 
 # ======================================================
@@ -18,8 +28,8 @@ DATA_FOLDER = "test_data"
 RESULT_ROOT = "result"
 
 # 비료 처방 옵션
-CROP_TYPE = 'soybean'
-TARGET_YIELD = 500
+CROP_TYPE = 'rice'
+TARGET_YIELD = 480
 BASAL_RATIO = 100
 SOIL_TEXTURE = '식양질'
 MIN_N_REQUIREMENT = 2.0
@@ -27,7 +37,6 @@ MIN_N_REQUIREMENT = 2.0
 # 비료 제품 정보
 FERTILIZER_N_CONTENT = 0.20
 FERTILIZER_BAG_WEIGHT = 20
-
 
 # ======================================================
 # 1. 공통 함수 정의
@@ -47,7 +56,6 @@ def get_main_angle(geometry):
             main_angle = math.degrees(math.atan2(dy, dx))
     return main_angle
 
-
 def export_isoxml(gdf, output_folder, task_name, rate_col='F_Need_10a'):
     taskdata_dir = os.path.join(output_folder, "TASKDATA")
     os.makedirs(taskdata_dir, exist_ok=True)
@@ -60,8 +68,7 @@ def export_isoxml(gdf, output_folder, task_name, rate_col='F_Need_10a'):
     zone_id = 0
     for rate_val, group in gdf.groupby('iso_rate'):
         zone_id += 1
-        tzn = ET.SubElement(task, "TZN",
-                            {"TreatmentZoneCode": str(zone_id), "TreatmentZoneDesignator": f"Rate_{rate_val}"})
+        tzn = ET.SubElement(task, "TZN", {"TreatmentZoneCode": str(zone_id), "TreatmentZoneDesignator": f"Rate_{rate_val}"})
         ET.SubElement(tzn, "PDV", {"ProcessDataDDI": "0006", "ProcessDataValue": str(rate_val)})
 
         for _, row in group.iterrows():
@@ -77,24 +84,20 @@ def export_isoxml(gdf, output_folder, task_name, rate_col='F_Need_10a'):
     tree.write(xml_path, encoding="UTF-8", xml_declaration=True)
     return xml_path
 
-
 def export_csv(gdf, output_folder, base_name):
     """
-    [수정] CSV 내보내기 (F_Total 추가됨)
-    - 순서: grid_id, F_Need_10a, F_Total, Center_Lat, Center_Lon, Vertices...
+    CSV 내보내기 (grid_id, F_Need_10a, F_Total, Center_Lat, Center_Lon, Vertices...)
     """
-    # 1. 중심점 계산 (미터 좌표계에서 계산하여 정확도 확보)
+    if gdf.crs is None:
+        gdf.set_crs("EPSG:5179", inplace=True)
+
     centroids_meter = gdf.geometry.centroid
     centroids_wgs = centroids_meter.to_crs(epsg=4326)
-
-    # 2. 전체 데이터프레임을 위경도로 변환 (꼭지점 추출용)
     gdf_wgs = gdf.to_crs(epsg=4326)
 
-    # 3. 중심점 좌표 할당
     gdf_wgs['Center_Lat'] = centroids_wgs.y
     gdf_wgs['Center_Lon'] = centroids_wgs.x
 
-    # 4. 꼭지점(Vertices) 추출
     vertex_data = []
     max_v = 0
 
@@ -104,45 +107,119 @@ def export_csv(gdf, output_folder, base_name):
             coords = list(geom.exterior.coords)
             if len(coords) > 1 and coords[0] == coords[-1]:
                 coords = coords[:-1]
-
             row_dict = {'grid_id': row['grid_id']}
-
             for i, (lon, lat) in enumerate(coords):
-                row_dict[f'V{i + 1}_Lat'] = lat
-                row_dict[f'V{i + 1}_Lon'] = lon
-
-            if len(coords) > max_v:
-                max_v = len(coords)
-
+                row_dict[f'V{i+1}_Lat'] = lat
+                row_dict[f'V{i+1}_Lon'] = lon
+            if len(coords) > max_v: max_v = len(coords)
             vertex_data.append(row_dict)
 
     v_df = pd.DataFrame(vertex_data)
-
-    # 5. 데이터 병합
     out_df = gdf_wgs.drop(columns=['geometry']).merge(v_df, on='grid_id', how='left')
 
-    # 6. 컬럼 정렬 및 필터링 (F_Total 추가)
-    # grid_id, F_Need_10a, F_Total, Center_Lat, Center_Lon 순서
     base_cols = ['grid_id', 'F_Need_10a', 'F_Total', 'Center_Lat', 'Center_Lon']
-
-    # 꼭지점 컬럼 (V1_Lat, V1_Lon ...)
     v_cols = []
     for i in range(max_v):
-        v_cols.append(f'V{i + 1}_Lat')
-        v_cols.append(f'V{i + 1}_Lon')
+        v_cols.append(f'V{i+1}_Lat')
+        v_cols.append(f'V{i+1}_Lon')
 
-    # 최종 저장할 컬럼 리스트
     final_cols = base_cols + v_cols
-
-    # 실제로 존재하는 컬럼만 선택
     final_cols = [c for c in final_cols if c in out_df.columns]
 
-    out_df = out_df[final_cols]
-
-    # 7. 저장
     csv_path = os.path.join(output_folder, f"{base_name}_Result.csv")
-    out_df.to_csv(csv_path, index=False, encoding='cp949')
+    out_df[final_cols].to_csv(csv_path, index=False, encoding='cp949')
     print(f"  - CSV 저장 완료: {os.path.basename(csv_path)}")
+
+def export_dji_tif(gdf, output_folder, base_name, rate_col='F_Need_10a'):
+    """
+    [수정] DJI 드론용 처방맵 생성
+    - Nodata(0) 처리를 강화하여 필지 바깥 영역을 투명하게 만듦 (Clipping 효과)
+    """
+    if rasterio is None: return
+
+    # 좌표계 안전장치
+    src_crs = gdf.crs
+    if src_crs is None:
+        print("  [경고] 데이터의 좌표계(CRS)가 유실되어 'EPSG:5179'로 강제 설정합니다.")
+        gdf.set_crs("EPSG:5179", inplace=True)
+        src_crs = gdf.crs
+
+    # 1. 단위 변환
+    gdf['DJI_Rate'] = gdf[rate_col] * 10
+
+    # [검증 로그]
+    min_rate = gdf['DJI_Rate'].min()
+    max_rate = gdf['DJI_Rate'].max()
+    mean_rate = gdf['DJI_Rate'].mean()
+    print(f"  [DJI-TIF 검증] 살포량(kg/ha) 범위: 최소 {min_rate:.1f} ~ 최대 {max_rate:.1f} (평균 {mean_rate:.1f})")
+
+    # 2. 래스터화 준비
+    pixel_size = 1.0
+    minx, miny, maxx, maxy = gdf.total_bounds
+    width = int(np.ceil((maxx - minx) / pixel_size))
+    height = int(np.ceil((maxy - miny) / pixel_size))
+
+    # 좌표 변환 행렬 (미터 좌표계)
+    src_transform = from_origin(minx, maxy, pixel_size, pixel_size)
+
+    # 3. 래스터 태우기 (Burn)
+    # fill=0 : 데이터가 없는 배경(필지 바깥)을 0으로 채움
+    shapes = ((geom, value) for geom, value in zip(gdf.geometry, gdf['DJI_Rate']))
+    src_array = rasterize(
+        shapes,
+        out_shape=(height, width),
+        transform=src_transform,
+        fill=0,
+        default_value=0,
+        dtype='float32',
+        all_touched=True
+    )
+
+    # 4. 좌표계 변환 (EPSG:5179 -> EPSG:4326 WGS84)
+    dst_crs = 'EPSG:4326'
+
+    dst_transform, dst_width, dst_height = calculate_default_transform(
+        src_crs, dst_crs, width, height, left=minx, bottom=miny, right=maxx, top=maxy
+    )
+
+    dst_array = np.zeros((dst_height, dst_width), dtype='float32')
+
+    # [핵심 수정] src_nodata=0, dst_nodata=0 설정
+    # 변환 과정에서 0인 값(배경)을 '데이터 없음'으로 확실하게 처리함
+    reproject(
+        source=src_array,
+        destination=dst_array,
+        src_transform=src_transform,
+        src_crs=src_crs,
+        src_nodata=0,        # 원본의 0은 데이터 없음임
+        dst_transform=dst_transform,
+        dst_crs=dst_crs,
+        dst_nodata=0,        # 결과의 0도 데이터 없음으로 처리
+        resampling=Resampling.nearest
+    )
+
+    # 5. GeoTIFF 저장
+    tif_path = os.path.join(output_folder, f"{base_name}_DJI.tif")
+    with rasterio.open(
+        tif_path, 'w', driver='GTiff',
+        height=dst_height, width=dst_width,
+        count=1, dtype='float32',
+        crs=dst_crs, transform=dst_transform,
+        nodata=0  # [핵심] 파일 헤더에 '0은 투명한 값'이라고 명시
+    ) as dst:
+        dst.write(dst_array, 1)
+
+    # 6. TFW 파일 생성
+    tfw_path = os.path.join(output_folder, f"{base_name}_DJI.tfw")
+    with open(tfw_path, 'w') as f:
+        f.write(f"{dst_transform.a}\n")
+        f.write(f"{dst_transform.b}\n")
+        f.write(f"{dst_transform.d}\n")
+        f.write(f"{dst_transform.e}\n")
+        f.write(f"{dst_transform.c + dst_transform.a / 2}\n")
+        f.write(f"{dst_transform.f + dst_transform.e / 2}\n")
+
+    print(f"  - DJI 처방맵(TIF, TFW) 저장 완료: {os.path.basename(tif_path)}")
 
 
 def fix_coordinate_system(gdf, tag):
@@ -165,14 +242,11 @@ def fix_coordinate_system(gdf, tag):
         print(f"  [오류] 좌표 변환 실패: {e}")
         return None
 
-
 def process_single_field(soil_path, boundary_path, base_name):
     print(f"\n>>> [처리 시작] {base_name}")
     try:
-        soil_input = f"zip://{soil_path}".replace("\\", "/") if not soil_path.startswith(
-            "zip://") else soil_path.replace("\\", "/")
-        bound_input = f"zip://{boundary_path}".replace("\\", "/") if not boundary_path.startswith(
-            "zip://") else boundary_path.replace("\\", "/")
+        soil_input = f"zip://{soil_path}".replace("\\", "/") if not soil_path.startswith("zip://") else soil_path.replace("\\", "/")
+        bound_input = f"zip://{boundary_path}".replace("\\", "/") if not boundary_path.startswith("zip://") else boundary_path.replace("\\", "/")
 
         points_gdf = None
         encodings = ['euc-kr', 'cp949', 'latin1', 'utf-8']
@@ -180,8 +254,7 @@ def process_single_field(soil_path, boundary_path, base_name):
             try:
                 points_gdf = gpd.read_file(soil_input, encoding=enc)
                 break
-            except:
-                continue
+            except: continue
         if points_gdf is None: points_gdf = gpd.read_file(soil_input)
         boundary_gdf = gpd.read_file(bound_input)
 
@@ -206,8 +279,8 @@ def process_single_field(soil_path, boundary_path, base_name):
             if col not in exclude_cols:
                 points_meter[col] = pd.to_numeric(points_meter[col], errors='coerce')
                 if points_meter[col].isnull().sum() > 0:
-                    points_meter[col] = points_meter[col].astype(str).str.extract(r'([-+]?\d*\.?\d+)')[0]
-                    points_meter[col] = pd.to_numeric(points_meter[col], errors='coerce')
+                     points_meter[col] = points_meter[col].astype(str).str.extract(r'([-+]?\d*\.?\d+)')[0]
+                     points_meter[col] = pd.to_numeric(points_meter[col], errors='coerce')
                 points_meter[col] = points_meter[col].fillna(0)
 
         numeric_cols = points_meter.select_dtypes(include=[np.number]).columns.tolist()
@@ -231,8 +304,7 @@ def process_single_field(soil_path, boundary_path, base_name):
     grid_size = 5
     cols = np.arange(xmin, xmax, grid_size)
     rows = np.arange(ymin, ymax, grid_size)
-    polygons = [Polygon([(x, y), (x + grid_size, y), (x + grid_size, y + grid_size), (x, y + grid_size)]) for x in cols
-                for y in rows]
+    polygons = [Polygon([(x, y), (x+grid_size, y), (x+grid_size, y+grid_size), (x, y+grid_size)]) for x in cols for y in rows]
     temp_grid = gpd.GeoDataFrame({'geometry': polygons}, crs="EPSG:5179")
     temp_grid['geometry'] = temp_grid['geometry'].apply(lambda g: affinity.rotate(g, rotation_angle, origin=centroid))
     clipped_grid = gpd.clip(temp_grid, boundary_meter).reset_index(drop=True)
@@ -247,6 +319,11 @@ def process_single_field(soil_path, boundary_path, base_name):
     grid_stats['grid_id'] = grid_stats['grid_id'].astype(int)
 
     final_grid = clipped_grid.merge(grid_stats, on='grid_id', how='left')
+
+    # [중요] Merge 후 CRS 유실 방지
+    if final_grid.crs is None:
+        final_grid.set_crs(clipped_grid.crs, inplace=True)
+
     final_grid[analysis_cols] = final_grid[analysis_cols].fillna(0)
 
     if 'OM' in final_grid.columns:
@@ -267,7 +344,6 @@ def process_single_field(soil_path, boundary_path, base_name):
     )
     final_grid = calculator.execute()
 
-    # 결과 저장
     field_result_dir = os.path.join(RESULT_ROOT, base_name)
     os.makedirs(field_result_dir, exist_ok=True)
 
@@ -286,17 +362,19 @@ def process_single_field(soil_path, boundary_path, base_name):
     final_grid_renamed[actual_save_cols].to_file(output_shp, encoding='euc-kr')
     print(f"  - SHP 저장 완료: {os.path.basename(output_shp)}")
 
-    # 2. CSV 저장 (수정됨)
+    # 2. CSV 저장
     export_csv(final_grid_renamed, field_result_dir, base_name)
 
-    # 3. ISOXML 저장
+    # 3. DJI Tiff 저장
+    export_dji_tif(final_grid_renamed, field_result_dir, base_name, rate_col='F_Need_10a')
+
+    # 4. ISOXML 저장
     try:
         isoxml_gdf = final_grid.to_crs(epsg=4326)
         export_isoxml(isoxml_gdf, field_result_dir, task_name=base_name, rate_col='F_Need_10a')
         print(f"  - ISOXML 저장 완료")
     except Exception as e:
         print(f"  - ISOXML 생성 오류: {e}")
-
 
 def find_matching_boundary(soil_file, all_boundary_files):
     folder, filename = os.path.split(soil_file)
@@ -307,7 +385,6 @@ def find_matching_boundary(soil_file, all_boundary_files):
     if len(candidates) == 1: return candidates[0], core_name
     if len(all_boundary_files) == 1: return all_boundary_files[0], core_name
     return None, core_name
-
 
 def main():
     if not os.path.exists(DATA_FOLDER):
@@ -324,12 +401,9 @@ def main():
 
     for soil_file in soil_files:
         matched_boundary, base_name = find_matching_boundary(soil_file, boundary_files)
-        if matched_boundary:
-            process_single_field(soil_file, matched_boundary, base_name)
-        else:
-            print(f"\n[건너뜀] 매칭 실패: {os.path.basename(soil_file)}")
+        if matched_boundary: process_single_field(soil_file, matched_boundary, base_name)
+        else: print(f"\n[건너뜀] 매칭 실패: {os.path.basename(soil_file)}")
     print(f"\n[완료] 결과 폴더: {os.path.abspath(RESULT_ROOT)}")
-
 
 if __name__ == "__main__":
     main()
