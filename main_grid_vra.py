@@ -24,18 +24,18 @@ from fertilizer_calculator import FertilizerCalculator
 # ======================================================
 # 0. 환경 설정
 # ======================================================
-DATA_FOLDER = "test_data"
+DATA_FOLDER = "new_data"
 RESULT_ROOT = "result"
 
 # 비료 처방 옵션
-CROP_TYPE = 'rice'
+CROP_TYPE = 'soybean'
 TARGET_YIELD = 480
 BASAL_RATIO = 100
 SOIL_TEXTURE = '식양질'
 MIN_N_REQUIREMENT = 2.0
 
 # 비료 제품 정보
-FERTILIZER_N_CONTENT = 0.20
+FERTILIZER_N_CONTENT = 0.08
 FERTILIZER_BAG_WEIGHT = 20
 
 # ======================================================
