@@ -38,7 +38,7 @@ MIN_N_REQUIREMENT = 2.0
 FERTILIZER_N_CONTENT = 0.20
 FERTILIZER_BAG_WEIGHT = 20
 
-# [신규] 생성할 그리드 사이즈 목록 (단위: m)
+# 생성할 그리드 사이즈 목록 (단위: m)
 GRID_SIZES = [2, 8, 16]
 
 
@@ -47,6 +47,7 @@ GRID_SIZES = [2, 8, 16]
 # ======================================================
 
 def get_main_angle(geometry):
+    """지오메트리의 최소 회전 사각형을 구하여 주 각도를 계산합니다."""
     rect = geometry.minimum_rotated_rectangle
     coords = list(rect.exterior.coords)
     max_len = 0
@@ -62,7 +63,8 @@ def get_main_angle(geometry):
 
 
 def export_isoxml(gdf, output_folder, task_name, rate_col='F_Need_10a'):
-    taskdata_dir = os.path.join(output_folder, f"TASKDATA_{task_name}")
+    """작업기계(트랙터 등) 인식을 위해 TASKDATA 폴더명으로 ISOXML을 생성합니다."""
+    taskdata_dir = os.path.join(output_folder, "TASKDATA")
     os.makedirs(taskdata_dir, exist_ok=True)
 
     root = ET.Element("ISO11783_TaskData", {"VersionMajor": "4", "VersionMinor": "3", "DataTransferOrigin": "1"})
@@ -92,6 +94,7 @@ def export_isoxml(gdf, output_folder, task_name, rate_col='F_Need_10a'):
 
 
 def export_csv(gdf, output_folder, file_prefix):
+    """중심 좌표 및 꼭짓점 위경도 정보를 포함하여 CSV로 내보냅니다."""
     if gdf.crs is None:
         gdf.set_crs("EPSG:5179", inplace=True)
 
@@ -136,6 +139,7 @@ def export_csv(gdf, output_folder, file_prefix):
 
 
 def export_dji_tif(gdf, output_folder, file_prefix, rate_col='F_Need_10a'):
+    """DJI 드론 인식을 위한 GeoTIFF 처방맵을 내보냅니다."""
     if rasterio is None: return
 
     src_crs = gdf.crs
@@ -206,6 +210,7 @@ def export_dji_tif(gdf, output_folder, file_prefix, rate_col='F_Need_10a'):
 
 
 def fix_coordinate_system(gdf, tag):
+    """데이터의 좌표계를 검사하고 EPSG:5179로 자동 변환합니다."""
     if gdf.crs is None:
         gdf.crs = "EPSG:4326"
 
@@ -213,6 +218,7 @@ def fix_coordinate_system(gdf, tag):
     mean_x = (bounds[0] + bounds[2]) / 2
     mean_y = (bounds[1] + bounds[3]) / 2
 
+    # 위도 경도가 반대로 들어간 경우 스왑
     if (30 < mean_x < 45) and (120 < mean_y < 135):
         gdf['geometry'] = gdf['geometry'].apply(lambda p: Point(p.y, p.x) if p.geom_type == 'Point' else p)
 
@@ -223,6 +229,7 @@ def fix_coordinate_system(gdf, tag):
 
 
 def process_single_field(soil_path, boundary_path, base_name):
+    """단일 필지에 대해 데이터를 병합하고 그리드 해상도별로 전용 폴더에 결과를 산출합니다."""
     print(f"\n==========================================")
     print(f">>> [필지 처리 시작] {base_name}")
     print(f"==========================================")
@@ -282,14 +289,25 @@ def process_single_field(soil_path, boundary_path, base_name):
     rotated_boundary = affinity.rotate(boundary_geom, -rotation_angle, origin=centroid)
     xmin, ymin, xmax, ymax = rotated_boundary.bounds
 
+    # 최상위 필지 폴더 생성 (예: result/TEST1)
     field_result_dir = os.path.join(RESULT_ROOT, base_name)
     os.makedirs(field_result_dir, exist_ok=True)
 
-    # [신규] 다양한 해상도(2m, 8m, 16m)별로 루프 실행
+    # 다양한 해상도(2m, 8m, 16m)별로 루프 실행
     for grid_size in GRID_SIZES:
-        # 파일명 규칙: TEST1_2mx2m
         file_prefix = f"{base_name}_{grid_size}mx{grid_size}m"
         print(f"\n  ▶ [작업] 그리드 해상도: {grid_size}m x {grid_size}m ({file_prefix})")
+
+        # ---------------------------------------------------------
+        # 그리드별 전용 결과 폴더 생성 및 바운더리 SHP 독립 저장
+        # ---------------------------------------------------------
+        grid_result_dir = os.path.join(field_result_dir, file_prefix)
+        os.makedirs(grid_result_dir, exist_ok=True)
+
+        boundary_shp_path = os.path.join(grid_result_dir, f"{base_name}_Boundary.shp")
+        boundary_meter.to_file(boundary_shp_path, encoding='euc-kr')
+        print(f"    - 바운더리 SHP 저장 완료: {os.path.basename(boundary_shp_path)}")
+        # ---------------------------------------------------------
 
         cols = np.arange(xmin, xmax, grid_size)
         rows = np.arange(ymin, ymax, grid_size)
@@ -313,6 +331,7 @@ def process_single_field(soil_path, boundary_path, base_name):
             final_grid.set_crs(clipped_grid.crs, inplace=True)
         final_grid[analysis_cols] = final_grid[analysis_cols].fillna(0)
 
+        # Calculator 클래스 호출
         calculator = FertilizerCalculator(
             final_grid,
             crop_type=CROP_TYPE,
@@ -331,7 +350,6 @@ def process_single_field(soil_path, boundary_path, base_name):
             'F_Total': 'F_Total'
         })
 
-        # [신규] 총 비료량 집계 및 출력
         total_fertilizer_kg = final_grid_renamed['F_Total'].sum()
         print(f"  ========================================")
         print(f"  ⭐ [{file_prefix}] 총 필요 비료량: {total_fertilizer_kg:,.2f} kg ⭐")
@@ -342,26 +360,27 @@ def process_single_field(soil_path, boundary_path, base_name):
         actual_save_cols = [c for c in save_cols if c in final_grid_renamed.columns]
 
         # 1. SHP 저장
-        output_shp = os.path.join(field_result_dir, f"{file_prefix}_Result.shp")
+        output_shp = os.path.join(grid_result_dir, f"{file_prefix}_Result.shp")
         final_grid_renamed[actual_save_cols].to_file(output_shp, encoding='euc-kr')
         print(f"    - SHP 저장 완료: {os.path.basename(output_shp)}")
 
         # 2. CSV 저장
-        export_csv(final_grid_renamed, field_result_dir, file_prefix)
+        export_csv(final_grid_renamed, grid_result_dir, file_prefix)
 
         # 3. DJI Tiff 저장
-        export_dji_tif(final_grid_renamed, field_result_dir, file_prefix, rate_col='F_Need_10a')
+        export_dji_tif(final_grid_renamed, grid_result_dir, file_prefix, rate_col='F_Need_10a')
 
-        # 4. ISOXML 저장
+        # 4. ISOXML 저장 (TASKDATA 폴더 생성)
         try:
             isoxml_gdf = final_grid.to_crs(epsg=4326)
-            export_isoxml(isoxml_gdf, field_result_dir, task_name=file_prefix, rate_col='F_Need_10a')
+            export_isoxml(isoxml_gdf, grid_result_dir, task_name=file_prefix, rate_col='F_Need_10a')
             print(f"    - ISOXML 저장 완료")
         except Exception as e:
             print(f"    - ISOXML 생성 오류: {e}")
 
 
 def find_matching_boundary(soil_file, all_boundary_files):
+    """토양 데이터와 이름이 매칭되는 바운더리 파일을 찾습니다."""
     folder, filename = os.path.split(soil_file)
     core_name = filename.replace("_Shapefile.zip", "")
     exact_match = os.path.join(folder, f"{core_name}_Boundary.zip")
@@ -378,7 +397,7 @@ def main():
         return
     soil_files = glob.glob(os.path.join(DATA_FOLDER, "*_Shapefile.zip"))
     boundary_files = glob.glob(os.path.join(DATA_FOLDER, "*_Boundary.zip"))
-    if not soil_files: print(f"[알림] 파일이 없습니다."); return
+    if not soil_files: print(f"[알림] 처리할 파일이 없습니다."); return
 
     print(f"==========================================")
     print(f" 설정: {CROP_TYPE}, 토성: {SOIL_TEXTURE}")
