@@ -39,7 +39,7 @@ FERTILIZER_N_CONTENT = 0.20
 FERTILIZER_BAG_WEIGHT = 20
 
 # 생성할 그리드 사이즈 목록 (단위: m)
-GRID_SIZES = [2, 8, 16]
+GRID_SIZES = [20]
 
 
 # ======================================================
