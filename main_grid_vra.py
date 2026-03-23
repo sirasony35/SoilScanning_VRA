@@ -62,28 +62,57 @@ def get_main_angle(geometry):
     return main_angle
 
 
-def export_isoxml(gdf, output_folder, task_name, rate_col='F_Need_10a'):
-    """작업기계(트랙터 등) 인식을 위해 TASKDATA 폴더명으로 ISOXML을 생성합니다."""
+def export_isoxml(gdf, output_folder, task_name, rate_col='F_Need_10a', rate_step=1.0):
+    """
+    작업기계(트랙터 등) 인식을 위해 TASKDATA 폴더명으로 ISOXML을 생성합니다.
+    [추가됨] 살포량을 특정 단위(rate_step)로 묶어 다각형을 병합(Dissolve)하여 용량을 최적화합니다.
+    """
     taskdata_dir = os.path.join(output_folder, "TASKDATA")
     os.makedirs(taskdata_dir, exist_ok=True)
 
     root = ET.Element("ISO11783_TaskData", {"VersionMajor": "4", "VersionMinor": "3", "DataTransferOrigin": "1"})
     task = ET.SubElement(root, "TSK", {"TaskDesignator": task_name, "TaskStatus": "1"})
 
-    gdf['iso_rate'] = (gdf[rate_col] * 1000).astype(int)
+    # 1. 살포량 구간화 (Binning/Rounding)
+    # rate_step이 1.0이면 정수 단위로, 5.0이면 5 단위로 묶어줍니다.
+    gdf_copy = gdf.copy()
+    gdf_copy['binned_rate'] = (gdf_copy[rate_col] / rate_step).round() * rate_step
+
+    # ISOBUS 단위 맞춤 (* 1000)
+    gdf_copy['iso_rate'] = (gdf_copy['binned_rate'] * 1000).astype(int)
+
+    # 2. 다각형 병합 (Dissolve)
+    # iso_rate가 같은 인접한 그리드들을 하나의 큰 다각형(Polygon/MultiPolygon)으로 합칩니다.
+    print(f"    - [최적화] ISOXML 다각형 병합(Dissolve) 진행 중...")
+    dissolved_gdf = gdf_copy.dissolve(by='iso_rate').reset_index()
 
     zone_id = 0
-    for rate_val, group in gdf.groupby('iso_rate'):
+    # 병합된 데이터프레임을 순회합니다.
+    for _, row in dissolved_gdf.iterrows():
+        rate_val = row['iso_rate']
+        if rate_val <= 0:  # 살포량이 0인 곳은 제외할 수 있습니다.
+            continue
+
         zone_id += 1
         tzn = ET.SubElement(task, "TZN",
                             {"TreatmentZoneCode": str(zone_id), "TreatmentZoneDesignator": f"Rate_{rate_val}"})
         ET.SubElement(tzn, "PDV", {"ProcessDataDDI": "0006", "ProcessDataValue": str(rate_val)})
 
-        for _, row in group.iterrows():
-            if row['geometry'].geom_type != 'Polygon': continue
+        geom = row['geometry']
+
+        # 3. MultiPolygon 처리
+        # 병합 결과가 여러 덩어리로 나뉜 경우(MultiPolygon) 각각을 PTN으로 생성합니다.
+        geometries = geom.geoms if geom.geom_type == 'MultiPolygon' else [geom]
+
+        for single_polygon in geometries:
+            if single_polygon.geom_type != 'Polygon':
+                continue
+
             ptn = ET.SubElement(tzn, "PTN")
             lsg = ET.SubElement(ptn, "LSG", {"LineStringType": "1"})
-            for lon, lat in zip(*row['geometry'].exterior.coords.xy):
+
+            # 다각형의 외곽선(exterior) 좌표 추출
+            for lon, lat in zip(*single_polygon.exterior.coords.xy):
                 ET.SubElement(lsg, "PNT", {"A": f"{lat:.9f}", "B": f"{lon:.9f}"})
 
     tree = ET.ElementTree(root)
