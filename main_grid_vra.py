@@ -63,8 +63,8 @@ def get_main_angle(geometry):
 
 def export_isoxml(gdf, boundary_geom, output_folder, task_name, rate_col='DOSE'):
     """
-    [FMS 살포량 스케일링 해결] DOSE 값을 100배수로 정수화하고,
-    VPN 태그의 Scale을 0.01로 지정하여 FMS에서 원래 소수점 값으로 표시되게 합니다.
+    [완벽 복구] 파싱에 성공했던 버전의 구조(줄바꿈 \r\n, 소수점 자릿수 유지)를 100% 복구하고,
+    DOSE 값만 정수화(round)하여 1000배 뻥튀기 현상을 깔끔하게 해결합니다.
     """
     if rasterio is None:
         return None
@@ -77,10 +77,10 @@ def export_isoxml(gdf, boundary_geom, output_folder, task_name, rate_col='DOSE')
         gdf_copy.set_crs("EPSG:5179", inplace=True)
     src_crs = gdf_copy.crs
 
-    # [수정 포인트 1] 소수점 2자리 보존을 위해 100만 곱합니다. (예: 450.55 -> 45055)
-    gdf_copy['iso_rate'] = (gdf_copy[rate_col] * 100).astype(np.int32)
+    # [핵심] 1000배를 하지 않고 DOSE(예: 450.55) 자체를 정수(451)로 반올림하여 기록.
+    # 이렇게 하면 FMS가 VPN C="1.0"을 통해 451.00 이라는 정상 수치로 화면에 띄워줍니다.
+    gdf_copy['iso_rate'] = gdf_copy[rate_col].round().astype(np.uint32)
 
-    # 래스터(배열) 생성
     pixel_size = 1.0
     minx, miny, maxx, maxy = gdf_copy.total_bounds
     width = int(np.ceil((maxx - minx) / pixel_size))
@@ -94,17 +94,16 @@ def export_isoxml(gdf, boundary_geom, output_folder, task_name, rate_col='DOSE')
         transform=src_transform,
         fill=0,
         default_value=0,
-        dtype='int32',
+        dtype='uint32',
         all_touched=True
     )
 
-    # WGS84 리프로젝션
     dst_crs = 'EPSG:4326'
     dst_transform, dst_width, dst_height = calculate_default_transform(
         src_crs, dst_crs, width, height, left=minx, bottom=miny, right=maxx, top=maxy
     )
 
-    dst_array = np.zeros((dst_height, dst_width), dtype='int32')
+    dst_array = np.zeros((dst_height, dst_width), dtype='uint32')
     reproject(
         source=src_array,
         destination=dst_array,
@@ -122,23 +121,19 @@ def export_isoxml(gdf, boundary_geom, output_folder, task_name, rate_col='DOSE')
     with open(bin_path, 'wb') as f:
         f.write(bin_array.astype('<i4').tobytes())
 
-    # XML 텍스트 정밀 조립 (FMS 호환)
+    # --- 파싱에 성공했던 포맷팅 로직 완벽 복구 ---
     min_lon = dst_transform.c
     max_lat = dst_transform.f
     cell_lon = dst_transform.a
     cell_lat = abs(dst_transform.e)
     min_lat = max_lat - (cell_lat * dst_height)
 
-    min_lat_str = str(round(min_lat, 14))
-    min_lon_str = str(round(min_lon, 14))
-    cell_lat_str = str(cell_lat).upper().replace('E-0', 'E-').replace('E+0', 'E+')
-    cell_lon_str = str(cell_lon).upper().replace('E-0', 'E-').replace('E+0', 'E+')
+    cell_lat_str = f"{cell_lat:.15E}".replace("E-0", "E-").replace("E+0", "E+")
+    cell_lon_str = f"{cell_lon:.15E}".replace("E-0", "E-").replace("E+0", "E+")
 
     field_area_sqm = int(boundary_geom.area)
-    safe_task_name = re.sub(r'[^A-Za-z0-9 ]+', '', task_name)[:20]
+    safe_task_name = task_name[:25]
     now_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-    pfd_id = str(random.randint(100000, 999999))
 
     boundary_wgs = gpd.GeoSeries([boundary_geom], crs="EPSG:5179").to_crs("EPSG:4326").iloc[0]
     if boundary_wgs.geom_type == 'MultiPolygon':
@@ -148,18 +143,20 @@ def export_isoxml(gdf, boundary_geom, output_folder, task_name, rate_col='DOSE')
     else:
         poly_to_use = boundary_wgs.convex_hull
 
+    # 파싱에 성공했던 텍스트 구조 토씨 하나 틀리지 않고 복구
     xml_lines = []
     xml_lines.append(
         '<ISO11783_TaskData VersionMinor="0" VersionMajor="4" DataTransferOrigin="1" ManagementSoftwareManufacturer="FMS" TaskControllerManufacturer="FMS" ManagementSoftwareVersion="2.1.6">')
     xml_lines.append('    <CTR A="CTR1" B="daedong"/>')
     xml_lines.append('    <FRM A="FRM1" B="daedong"/>')
     xml_lines.append('    <PDT A="PDT1" B="Fertilizer"/>')
-    xml_lines.append(f'    <PFD A="PFD1" B="{pfd_id}" C="{safe_task_name}" D="{field_area_sqm}" E="CTR1" F="FRM1">')
+    xml_lines.append(f'    <PFD A="PFD1" B="1" C="{safe_task_name}" D="{field_area_sqm}" E="CTR1" F="FRM1">')
     xml_lines.append(f'        <PLN A="1" B="{safe_task_name}" C="{field_area_sqm}" E="PLN1">')
     xml_lines.append('            <LSG A="1">')
 
     for lon, lat in zip(*poly_to_use.exterior.coords.xy):
-        xml_lines.append(f'                <PNT A="2" C="{str(round(lat, 10))}" D="{str(round(lon, 10))}"/>')
+        # 성공했던 :.9f 고정 포맷
+        xml_lines.append(f'                <PNT A="2" C="{lat:.9f}" D="{lon:.9f}"/>')
 
     xml_lines.append('            </LSG>')
     xml_lines.append('        </PLN>')
@@ -167,8 +164,9 @@ def export_isoxml(gdf, boundary_geom, output_folder, task_name, rate_col='DOSE')
     xml_lines.append(f'    <TSK A="TSK1" B="{safe_task_name}" C="CTR1" D="FRM1" E="PFD1" G="1">')
     xml_lines.append(f'        <TIM A="{now_str}" B="{now_str}" D="1"/>')
     xml_lines.append('        <DLT A="DFFF" B="31"/>')
+    # 성공했던 :.15f 고정 포맷
     xml_lines.append(
-        f'        <GRD G="GRD00000" A="{min_lat_str}" B="{min_lon_str}" C="{cell_lat_str}" D="{cell_lon_str}" E="{dst_width}" F="{dst_height}" I="2" J="0"/>')
+        f'        <GRD G="GRD00000" A="{min_lat:.15f}" B="{min_lon:.15f}" C="{cell_lat_str}" D="{cell_lon_str}" E="{dst_width}" F="{dst_height}" I="2" J="0"/>')
     xml_lines.append('        <TZN A="254" B="Default">')
     xml_lines.append('            <PDV A="0006" B="0" C="PDT1"/>')
     xml_lines.append('        </TZN>')
@@ -179,14 +177,13 @@ def export_isoxml(gdf, boundary_geom, output_folder, task_name, rate_col='DOSE')
     xml_lines.append('            <PDV A="0006" B="0" C="PDT1"/>')
     xml_lines.append('        </TZN>')
     xml_lines.append('    </TSK>')
-
-    # [수정 포인트 2] 배율(Scale)인 C를 0.01로 지정하여 FMS 화면에 제대로 나오게 합니다.
-    xml_lines.append('    <VPN A="VPN1" B="0" C="0.01" D="2"/>')
+    xml_lines.append('    <VPN A="VPN1" B="0" C="1.0" D="2"/>')
     xml_lines.append('</ISO11783_TaskData>')
 
+    # 성공했던 \r\n 바이트 쓰기 방식 복구
     xml_path = os.path.join(taskdata_dir, "TASKDATA.XML")
-    with open(xml_path, 'w', encoding='utf-8', newline='\n') as f:
-        f.write('\n'.join(xml_lines) + '\n')
+    with open(xml_path, 'wb') as f:
+        f.write(('\r\n'.join(xml_lines) + '\r\n').encode('utf-8'))
 
     return xml_path
 
