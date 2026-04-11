@@ -8,15 +8,18 @@ import os
 import glob
 import xml.etree.ElementTree as ET
 import re
+import datetime
+import zipfile
+import random  # [추가] FMS 필수 6자리 ID 생성을 위해 추가
 
-# [필수] Rasterio 라이브러리 (DJI Tiff 생성용)
+# [필수] Rasterio 라이브러리 (DJI Tiff 및 ISOXML BIN 생성용)
 try:
     import rasterio
     from rasterio.transform import from_origin
     from rasterio.features import rasterize
     from rasterio.warp import calculate_default_transform, reproject, Resampling
 except ImportError:
-    print("[경고] 'rasterio' 라이브러리가 없습니다. DJI 처방맵 생성을 위해 'pip install rasterio'를 설치해주세요.")
+    print("[경고] 'rasterio' 라이브러리가 없습니다. 처방맵 생성을 위해 'pip install rasterio'를 설치해주세요.")
     rasterio = None
 
 from fertilizer_calculator import FertilizerCalculator
@@ -27,19 +30,16 @@ from fertilizer_calculator import FertilizerCalculator
 DATA_FOLDER = "new_data"
 RESULT_ROOT = "result"
 
-# 비료 처방 옵션
 CROP_TYPE = 'soybean'
 TARGET_YIELD = 500
 BASAL_RATIO = 100
 SOIL_TEXTURE = '식양질'
 MIN_N_REQUIREMENT = 2.0
 
-# 비료 제품 정보
 FERTILIZER_N_CONTENT = 0.20
 FERTILIZER_BAG_WEIGHT = 20
 
-# 생성할 그리드 사이즈 목록 (단위: m)
-GRID_SIZES = [20]
+GRID_SIZES = [16]
 
 
 # ======================================================
@@ -47,7 +47,6 @@ GRID_SIZES = [20]
 # ======================================================
 
 def get_main_angle(geometry):
-    """지오메트리의 최소 회전 사각형을 구하여 주 각도를 계산합니다."""
     rect = geometry.minimum_rotated_rectangle
     coords = list(rect.exterior.coords)
     max_len = 0
@@ -62,68 +61,137 @@ def get_main_angle(geometry):
     return main_angle
 
 
-def export_isoxml(gdf, output_folder, task_name, rate_col='F_Need_10a', rate_step=1.0):
+def export_isoxml(gdf, boundary_geom, output_folder, task_name, rate_col='DOSE'):
     """
-    작업기계(트랙터 등) 인식을 위해 TASKDATA 폴더명으로 ISOXML을 생성합니다.
-    [추가됨] 살포량을 특정 단위(rate_step)로 묶어 다각형을 병합(Dissolve)하여 용량을 최적화합니다.
+    [FMS 살포량 스케일링 해결] DOSE 값을 100배수로 정수화하고,
+    VPN 태그의 Scale을 0.01로 지정하여 FMS에서 원래 소수점 값으로 표시되게 합니다.
     """
+    if rasterio is None:
+        return None
+
     taskdata_dir = os.path.join(output_folder, "TASKDATA")
     os.makedirs(taskdata_dir, exist_ok=True)
 
-    root = ET.Element("ISO11783_TaskData", {"VersionMajor": "4", "VersionMinor": "3", "DataTransferOrigin": "1"})
-    task = ET.SubElement(root, "TSK", {"TaskDesignator": task_name, "TaskStatus": "1"})
-
-    # 1. 살포량 구간화 (Binning/Rounding)
-    # rate_step이 1.0이면 정수 단위로, 5.0이면 5 단위로 묶어줍니다.
     gdf_copy = gdf.copy()
-    gdf_copy['binned_rate'] = (gdf_copy[rate_col] / rate_step).round() * rate_step
+    if gdf_copy.crs is None:
+        gdf_copy.set_crs("EPSG:5179", inplace=True)
+    src_crs = gdf_copy.crs
 
-    # ISOBUS 단위 맞춤 (* 1000)
-    gdf_copy['iso_rate'] = (gdf_copy['binned_rate'] * 1000).astype(int)
+    # [수정 포인트 1] 소수점 2자리 보존을 위해 100만 곱합니다. (예: 450.55 -> 45055)
+    gdf_copy['iso_rate'] = (gdf_copy[rate_col] * 100).astype(np.int32)
 
-    # 2. 다각형 병합 (Dissolve)
-    # iso_rate가 같은 인접한 그리드들을 하나의 큰 다각형(Polygon/MultiPolygon)으로 합칩니다.
-    print(f"    - [최적화] ISOXML 다각형 병합(Dissolve) 진행 중...")
-    dissolved_gdf = gdf_copy.dissolve(by='iso_rate').reset_index()
+    # 래스터(배열) 생성
+    pixel_size = 1.0
+    minx, miny, maxx, maxy = gdf_copy.total_bounds
+    width = int(np.ceil((maxx - minx) / pixel_size))
+    height = int(np.ceil((maxy - miny) / pixel_size))
+    src_transform = from_origin(minx, maxy, pixel_size, pixel_size)
 
-    zone_id = 0
-    # 병합된 데이터프레임을 순회합니다.
-    for _, row in dissolved_gdf.iterrows():
-        rate_val = row['iso_rate']
-        if rate_val <= 0:  # 살포량이 0인 곳은 제외할 수 있습니다.
-            continue
+    shapes = ((geom, value) for geom, value in zip(gdf_copy.geometry, gdf_copy['iso_rate']))
+    src_array = rasterize(
+        shapes,
+        out_shape=(height, width),
+        transform=src_transform,
+        fill=0,
+        default_value=0,
+        dtype='int32',
+        all_touched=True
+    )
 
-        zone_id += 1
-        tzn = ET.SubElement(task, "TZN",
-                            {"TreatmentZoneCode": str(zone_id), "TreatmentZoneDesignator": f"Rate_{rate_val}"})
-        ET.SubElement(tzn, "PDV", {"ProcessDataDDI": "0006", "ProcessDataValue": str(rate_val)})
+    # WGS84 리프로젝션
+    dst_crs = 'EPSG:4326'
+    dst_transform, dst_width, dst_height = calculate_default_transform(
+        src_crs, dst_crs, width, height, left=minx, bottom=miny, right=maxx, top=maxy
+    )
 
-        geom = row['geometry']
+    dst_array = np.zeros((dst_height, dst_width), dtype='int32')
+    reproject(
+        source=src_array,
+        destination=dst_array,
+        src_transform=src_transform,
+        src_crs=src_crs,
+        src_nodata=0,
+        dst_transform=dst_transform,
+        dst_crs=dst_crs,
+        dst_nodata=0,
+        resampling=Resampling.nearest
+    )
 
-        # 3. MultiPolygon 처리
-        # 병합 결과가 여러 덩어리로 나뉜 경우(MultiPolygon) 각각을 PTN으로 생성합니다.
-        geometries = geom.geoms if geom.geom_type == 'MultiPolygon' else [geom]
+    bin_array = np.flipud(dst_array)
+    bin_path = os.path.join(taskdata_dir, "GRD00000.bin")
+    with open(bin_path, 'wb') as f:
+        f.write(bin_array.astype('<i4').tobytes())
 
-        for single_polygon in geometries:
-            if single_polygon.geom_type != 'Polygon':
-                continue
+    # XML 텍스트 정밀 조립 (FMS 호환)
+    min_lon = dst_transform.c
+    max_lat = dst_transform.f
+    cell_lon = dst_transform.a
+    cell_lat = abs(dst_transform.e)
+    min_lat = max_lat - (cell_lat * dst_height)
 
-            ptn = ET.SubElement(tzn, "PTN")
-            lsg = ET.SubElement(ptn, "LSG", {"LineStringType": "1"})
+    min_lat_str = str(round(min_lat, 14))
+    min_lon_str = str(round(min_lon, 14))
+    cell_lat_str = str(cell_lat).upper().replace('E-0', 'E-').replace('E+0', 'E+')
+    cell_lon_str = str(cell_lon).upper().replace('E-0', 'E-').replace('E+0', 'E+')
 
-            # 다각형의 외곽선(exterior) 좌표 추출
-            for lon, lat in zip(*single_polygon.exterior.coords.xy):
-                ET.SubElement(lsg, "PNT", {"A": f"{lat:.9f}", "B": f"{lon:.9f}"})
+    field_area_sqm = int(boundary_geom.area)
+    safe_task_name = re.sub(r'[^A-Za-z0-9 ]+', '', task_name)[:20]
+    now_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    tree = ET.ElementTree(root)
-    ET.indent(tree, space="  ")
+    pfd_id = str(random.randint(100000, 999999))
+
+    boundary_wgs = gpd.GeoSeries([boundary_geom], crs="EPSG:5179").to_crs("EPSG:4326").iloc[0]
+    if boundary_wgs.geom_type == 'MultiPolygon':
+        poly_to_use = max(boundary_wgs.geoms, key=lambda a: a.area)
+    elif boundary_wgs.geom_type == 'Polygon':
+        poly_to_use = boundary_wgs
+    else:
+        poly_to_use = boundary_wgs.convex_hull
+
+    xml_lines = []
+    xml_lines.append(
+        '<ISO11783_TaskData VersionMinor="0" VersionMajor="4" DataTransferOrigin="1" ManagementSoftwareManufacturer="FMS" TaskControllerManufacturer="FMS" ManagementSoftwareVersion="2.1.6">')
+    xml_lines.append('    <CTR A="CTR1" B="daedong"/>')
+    xml_lines.append('    <FRM A="FRM1" B="daedong"/>')
+    xml_lines.append('    <PDT A="PDT1" B="Fertilizer"/>')
+    xml_lines.append(f'    <PFD A="PFD1" B="{pfd_id}" C="{safe_task_name}" D="{field_area_sqm}" E="CTR1" F="FRM1">')
+    xml_lines.append(f'        <PLN A="1" B="{safe_task_name}" C="{field_area_sqm}" E="PLN1">')
+    xml_lines.append('            <LSG A="1">')
+
+    for lon, lat in zip(*poly_to_use.exterior.coords.xy):
+        xml_lines.append(f'                <PNT A="2" C="{str(round(lat, 10))}" D="{str(round(lon, 10))}"/>')
+
+    xml_lines.append('            </LSG>')
+    xml_lines.append('        </PLN>')
+    xml_lines.append('    </PFD>')
+    xml_lines.append(f'    <TSK A="TSK1" B="{safe_task_name}" C="CTR1" D="FRM1" E="PFD1" G="1">')
+    xml_lines.append(f'        <TIM A="{now_str}" B="{now_str}" D="1"/>')
+    xml_lines.append('        <DLT A="DFFF" B="31"/>')
+    xml_lines.append(
+        f'        <GRD G="GRD00000" A="{min_lat_str}" B="{min_lon_str}" C="{cell_lat_str}" D="{cell_lon_str}" E="{dst_width}" F="{dst_height}" I="2" J="0"/>')
+    xml_lines.append('        <TZN A="254" B="Default">')
+    xml_lines.append('            <PDV A="0006" B="0" C="PDT1"/>')
+    xml_lines.append('        </TZN>')
+    xml_lines.append('        <TZN A="253" B="Out of Field">')
+    xml_lines.append('            <PDV A="0006" B="0" C="PDT1"/>')
+    xml_lines.append('        </TZN>')
+    xml_lines.append('        <TZN A="0" B="Position Lost">')
+    xml_lines.append('            <PDV A="0006" B="0" C="PDT1"/>')
+    xml_lines.append('        </TZN>')
+    xml_lines.append('    </TSK>')
+
+    # [수정 포인트 2] 배율(Scale)인 C를 0.01로 지정하여 FMS 화면에 제대로 나오게 합니다.
+    xml_lines.append('    <VPN A="VPN1" B="0" C="0.01" D="2"/>')
+    xml_lines.append('</ISO11783_TaskData>')
+
     xml_path = os.path.join(taskdata_dir, "TASKDATA.XML")
-    tree.write(xml_path, encoding="UTF-8", xml_declaration=True)
+    with open(xml_path, 'w', encoding='utf-8', newline='\n') as f:
+        f.write('\n'.join(xml_lines) + '\n')
+
     return xml_path
 
 
 def export_csv(gdf, output_folder, file_prefix):
-    """중심 좌표 및 꼭짓점 위경도 정보를 포함하여 CSV로 내보냅니다."""
     if gdf.crs is None:
         gdf.set_crs("EPSG:5179", inplace=True)
 
@@ -143,7 +211,7 @@ def export_csv(gdf, output_folder, file_prefix):
             coords = list(geom.exterior.coords)
             if len(coords) > 1 and coords[0] == coords[-1]:
                 coords = coords[:-1]
-            row_dict = {'grid_id': row['grid_id']}
+            row_dict = {'grid_id': row['ZONE']}
             for i, (lon, lat) in enumerate(coords):
                 row_dict[f'V{i + 1}_Lat'] = lat
                 row_dict[f'V{i + 1}_Lon'] = lon
@@ -151,9 +219,9 @@ def export_csv(gdf, output_folder, file_prefix):
             vertex_data.append(row_dict)
 
     v_df = pd.DataFrame(vertex_data)
-    out_df = gdf_wgs.drop(columns=['geometry']).merge(v_df, on='grid_id', how='left')
+    out_df = gdf_wgs.drop(columns=['geometry']).merge(v_df, left_on='ZONE', right_on='grid_id', how='left')
 
-    base_cols = ['grid_id', 'F_Need_10a', 'F_Total', 'Center_Lat', 'Center_Lon']
+    base_cols = ['ZONE', 'PRODUCT', 'DOSE', 'DOSE_UNIT', 'Center_Lat', 'Center_Lon']
     v_cols = []
     for i in range(max_v):
         v_cols.append(f'V{i + 1}_Lat')
@@ -167,8 +235,7 @@ def export_csv(gdf, output_folder, file_prefix):
     print(f"    - CSV 저장 완료: {os.path.basename(csv_path)}")
 
 
-def export_dji_tif(gdf, output_folder, file_prefix, rate_col='F_Need_10a'):
-    """DJI 드론 인식을 위한 GeoTIFF 처방맵을 내보냅니다."""
+def export_dji_tif(gdf, output_folder, file_prefix, rate_col='DOSE'):
     if rasterio is None: return
 
     src_crs = gdf.crs
@@ -176,7 +243,7 @@ def export_dji_tif(gdf, output_folder, file_prefix, rate_col='F_Need_10a'):
         gdf.set_crs("EPSG:5179", inplace=True)
         src_crs = gdf.crs
 
-    gdf['DJI_Rate'] = gdf[rate_col] * 10
+    gdf['DJI_Rate'] = gdf[rate_col]
 
     pixel_size = 1.0
     minx, miny, maxx, maxy = gdf.total_bounds
@@ -197,7 +264,6 @@ def export_dji_tif(gdf, output_folder, file_prefix, rate_col='F_Need_10a'):
     )
 
     dst_crs = 'EPSG:4326'
-
     dst_transform, dst_width, dst_height = calculate_default_transform(
         src_crs, dst_crs, width, height, left=minx, bottom=miny, right=maxx, top=maxy
     )
@@ -239,7 +305,6 @@ def export_dji_tif(gdf, output_folder, file_prefix, rate_col='F_Need_10a'):
 
 
 def fix_coordinate_system(gdf, tag):
-    """데이터의 좌표계를 검사하고 EPSG:5179로 자동 변환합니다."""
     if gdf.crs is None:
         gdf.crs = "EPSG:4326"
 
@@ -247,7 +312,6 @@ def fix_coordinate_system(gdf, tag):
     mean_x = (bounds[0] + bounds[2]) / 2
     mean_y = (bounds[1] + bounds[3]) / 2
 
-    # 위도 경도가 반대로 들어간 경우 스왑
     if (30 < mean_x < 45) and (120 < mean_y < 135):
         gdf['geometry'] = gdf['geometry'].apply(lambda p: Point(p.y, p.x) if p.geom_type == 'Point' else p)
 
@@ -258,7 +322,6 @@ def fix_coordinate_system(gdf, tag):
 
 
 def process_single_field(soil_path, boundary_path, base_name):
-    """단일 필지에 대해 데이터를 병합하고 그리드 해상도별로 전용 폴더에 결과를 산출합니다."""
     print(f"\n==========================================")
     print(f">>> [필지 처리 시작] {base_name}")
     print(f"==========================================")
@@ -318,25 +381,19 @@ def process_single_field(soil_path, boundary_path, base_name):
     rotated_boundary = affinity.rotate(boundary_geom, -rotation_angle, origin=centroid)
     xmin, ymin, xmax, ymax = rotated_boundary.bounds
 
-    # 최상위 필지 폴더 생성 (예: result/TEST1)
     field_result_dir = os.path.join(RESULT_ROOT, base_name)
     os.makedirs(field_result_dir, exist_ok=True)
 
-    # 다양한 해상도(2m, 8m, 16m)별로 루프 실행
     for grid_size in GRID_SIZES:
         file_prefix = f"{base_name}_{grid_size}mx{grid_size}m"
         print(f"\n  ▶ [작업] 그리드 해상도: {grid_size}m x {grid_size}m ({file_prefix})")
 
-        # ---------------------------------------------------------
-        # 그리드별 전용 결과 폴더 생성 및 바운더리 SHP 독립 저장
-        # ---------------------------------------------------------
         grid_result_dir = os.path.join(field_result_dir, file_prefix)
         os.makedirs(grid_result_dir, exist_ok=True)
 
+        boundary_wgs = boundary_meter.to_crs(epsg=4326)
         boundary_shp_path = os.path.join(grid_result_dir, f"{base_name}_Boundary.shp")
-        boundary_meter.to_file(boundary_shp_path, encoding='euc-kr')
-        print(f"    - 바운더리 SHP 저장 완료: {os.path.basename(boundary_shp_path)}")
-        # ---------------------------------------------------------
+        boundary_wgs.to_file(boundary_shp_path, encoding='utf-8')
 
         cols = np.arange(xmin, xmax, grid_size)
         rows = np.arange(ymin, ymax, grid_size)
@@ -349,9 +406,7 @@ def process_single_field(soil_path, boundary_path, base_name):
         clipped_grid = gpd.clip(temp_grid, boundary_meter).reset_index(drop=True)
 
         clipped_grid['grid_id'] = (clipped_grid.index + 1).astype(int)
-
         joined = gpd.sjoin(clipped_grid, points_meter, how="inner", predicate="intersects")
-
         grid_stats = joined.groupby('grid_id')[analysis_cols].mean().reset_index()
         grid_stats['grid_id'] = grid_stats['grid_id'].astype(int)
 
@@ -360,7 +415,6 @@ def process_single_field(soil_path, boundary_path, base_name):
             final_grid.set_crs(clipped_grid.crs, inplace=True)
         final_grid[analysis_cols] = final_grid[analysis_cols].fillna(0)
 
-        # Calculator 클래스 호출
         calculator = FertilizerCalculator(
             final_grid,
             crop_type=CROP_TYPE,
@@ -372,44 +426,50 @@ def process_single_field(soil_path, boundary_path, base_name):
         )
         final_grid = calculator.execute()
 
-        final_grid_renamed = final_grid.rename(columns={
-            'N_Need_10a': 'N_Need_10a',
-            'N_Total': 'N_Total',
-            'F_Need_10a': 'F_Need_10a',
-            'F_Total': 'F_Total'
-        })
+        raw_dose = final_grid['F_Need_10a'] * 10
+        num_classes = 5
+        unique_vals = raw_dose.nunique()
 
-        total_fertilizer_kg = final_grid_renamed['F_Total'].sum()
-        print(f"  ========================================")
-        print(f"  ⭐ [{file_prefix}] 총 필요 비료량: {total_fertilizer_kg:,.2f} kg ⭐")
-        print(f"  ========================================")
+        if unique_vals > num_classes:
+            _, bins = pd.cut(raw_dose, bins=num_classes, retbins=True, duplicates='drop')
+            labels = [(bins[i] + bins[i + 1]) / 2 for i in range(len(bins) - 1)]
+            product_labels = list(range(1, len(labels) + 1))
 
-        save_cols = ['grid_id', 'Grid_Area', 'N_Need_10a', 'N_Total', 'F_Need_10a', 'F_Total',
-                     'geometry'] + analysis_cols
-        actual_save_cols = [c for c in save_cols if c in final_grid_renamed.columns]
+            final_grid['DOSE'] = pd.cut(raw_dose, bins=bins, labels=labels, include_lowest=True).astype(float).round(2)
+            final_grid['PRODUCT'] = pd.cut(raw_dose, bins=bins, labels=product_labels, include_lowest=True).astype(int)
+        else:
+            final_grid['DOSE'] = raw_dose.round(2)
+            final_grid['PRODUCT'] = final_grid['DOSE'].rank(method='dense').astype(int)
 
-        # 1. SHP 저장
+        final_grid['ZONE'] = final_grid['grid_id']
+        final_grid['DOSE_UNIT'] = 'kg/ha'
+
+        shp_cols = ['DOSE', 'ZONE', 'DOSE_UNIT', 'PRODUCT', 'geometry']
+        shp_export_gdf = final_grid[shp_cols].to_crs(epsg=4326)
+
         output_shp = os.path.join(grid_result_dir, f"{file_prefix}_Result.shp")
-        final_grid_renamed[actual_save_cols].to_file(output_shp, encoding='euc-kr')
+        shp_export_gdf.to_file(output_shp, encoding='utf-8')
         print(f"    - SHP 저장 완료: {os.path.basename(output_shp)}")
 
-        # 2. CSV 저장
-        export_csv(final_grid_renamed, grid_result_dir, file_prefix)
+        zip_path = os.path.join(grid_result_dir, f"{file_prefix}_Result_SHP.zip")
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+            for ext in ['.shp', '.shx', '.dbf', '.prj', '.cpg']:
+                file_to_zip = output_shp.replace('.shp', ext)
+                if os.path.exists(file_to_zip):
+                    zf.write(file_to_zip, os.path.basename(file_to_zip))
+        print(f"    - 처방맵 ZIP 파일(SHP 포함) 생성 완료: {os.path.basename(zip_path)}")
 
-        # 3. DJI Tiff 저장
-        export_dji_tif(final_grid_renamed, grid_result_dir, file_prefix, rate_col='F_Need_10a')
+        export_csv(final_grid, grid_result_dir, file_prefix)
+        export_dji_tif(final_grid, grid_result_dir, file_prefix, rate_col='DOSE')
 
-        # 4. ISOXML 저장 (TASKDATA 폴더 생성)
         try:
-            isoxml_gdf = final_grid.to_crs(epsg=4326)
-            export_isoxml(isoxml_gdf, grid_result_dir, task_name=file_prefix, rate_col='F_Need_10a')
-            print(f"    - ISOXML 저장 완료")
+            export_isoxml(final_grid, boundary_geom, grid_result_dir, task_name=file_prefix, rate_col='DOSE')
+            print(f"    - ISOXML(GRID) 저장 완료")
         except Exception as e:
             print(f"    - ISOXML 생성 오류: {e}")
 
 
 def find_matching_boundary(soil_file, all_boundary_files):
-    """토양 데이터와 이름이 매칭되는 바운더리 파일을 찾습니다."""
     folder, filename = os.path.split(soil_file)
     core_name = filename.replace("_Shapefile.zip", "")
     exact_match = os.path.join(folder, f"{core_name}_Boundary.zip")
