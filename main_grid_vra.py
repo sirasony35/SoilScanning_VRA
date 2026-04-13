@@ -27,7 +27,7 @@ from fertilizer_calculator import FertilizerCalculator
 # ======================================================
 # 0. 환경 설정
 # ======================================================
-DATA_FOLDER = "new_data"
+DATA_FOLDER = "new_data_0413"
 RESULT_ROOT = "result"
 
 CROP_TYPE = 'soybean'
@@ -39,7 +39,7 @@ MIN_N_REQUIREMENT = 2.0
 FERTILIZER_N_CONTENT = 0.20
 FERTILIZER_BAG_WEIGHT = 20
 
-GRID_SIZES = [16]
+GRID_SIZES = [10, 16, 20]
 
 
 # ======================================================
@@ -63,8 +63,7 @@ def get_main_angle(geometry):
 
 def export_isoxml(gdf, boundary_geom, output_folder, task_name, rate_col='DOSE'):
     """
-    [완벽 복구] 파싱에 성공했던 버전의 구조(줄바꿈 \r\n, 소수점 자릿수 유지)를 100% 복구하고,
-    DOSE 값만 정수화(round)하여 1000배 뻥튀기 현상을 깔끔하게 해결합니다.
+    [FMS 중복 에러 및 파싱 에러 완벽 해결]
     """
     if rasterio is None:
         return None
@@ -77,8 +76,7 @@ def export_isoxml(gdf, boundary_geom, output_folder, task_name, rate_col='DOSE')
         gdf_copy.set_crs("EPSG:5179", inplace=True)
     src_crs = gdf_copy.crs
 
-    # [핵심] 1000배를 하지 않고 DOSE(예: 450.55) 자체를 정수(451)로 반올림하여 기록.
-    # 이렇게 하면 FMS가 VPN C="1.0"을 통해 451.00 이라는 정상 수치로 화면에 띄워줍니다.
+    # DOSE(예: 450.55) 자체를 정수(451)로 반올림하여 기록.
     gdf_copy['iso_rate'] = gdf_copy[rate_col].round().astype(np.uint32)
 
     pixel_size = 1.0
@@ -121,7 +119,6 @@ def export_isoxml(gdf, boundary_geom, output_folder, task_name, rate_col='DOSE')
     with open(bin_path, 'wb') as f:
         f.write(bin_array.astype('<i4').tobytes())
 
-    # --- 파싱에 성공했던 포맷팅 로직 완벽 복구 ---
     min_lon = dst_transform.c
     max_lat = dst_transform.f
     cell_lon = dst_transform.a
@@ -132,7 +129,11 @@ def export_isoxml(gdf, boundary_geom, output_folder, task_name, rate_col='DOSE')
     cell_lon_str = f"{cell_lon:.15E}".replace("E-0", "E-").replace("E+0", "E+")
 
     field_area_sqm = int(boundary_geom.area)
-    safe_task_name = task_name[:25]
+
+    # [핵심] FMS 중복 방지를 위한 랜덤 4자리 고유 번호 할당
+    unique_suffix = str(random.randint(1000, 9999))
+    safe_task_name = task_name[:20] + f"_{unique_suffix}"
+
     now_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     boundary_wgs = gpd.GeoSeries([boundary_geom], crs="EPSG:5179").to_crs("EPSG:4326").iloc[0]
@@ -143,19 +144,18 @@ def export_isoxml(gdf, boundary_geom, output_folder, task_name, rate_col='DOSE')
     else:
         poly_to_use = boundary_wgs.convex_hull
 
-    # 파싱에 성공했던 텍스트 구조 토씨 하나 틀리지 않고 복구
     xml_lines = []
     xml_lines.append(
         '<ISO11783_TaskData VersionMinor="0" VersionMajor="4" DataTransferOrigin="1" ManagementSoftwareManufacturer="FMS" TaskControllerManufacturer="FMS" ManagementSoftwareVersion="2.1.6">')
     xml_lines.append('    <CTR A="CTR1" B="daedong"/>')
     xml_lines.append('    <FRM A="FRM1" B="daedong"/>')
     xml_lines.append('    <PDT A="PDT1" B="Fertilizer"/>')
-    xml_lines.append(f'    <PFD A="PFD1" B="1" C="{safe_task_name}" D="{field_area_sqm}" E="CTR1" F="FRM1">')
+    xml_lines.append(
+        f'    <PFD A="PFD1" B="{unique_suffix}" C="{safe_task_name}" D="{field_area_sqm}" E="CTR1" F="FRM1">')
     xml_lines.append(f'        <PLN A="1" B="{safe_task_name}" C="{field_area_sqm}" E="PLN1">')
     xml_lines.append('            <LSG A="1">')
 
     for lon, lat in zip(*poly_to_use.exterior.coords.xy):
-        # 성공했던 :.9f 고정 포맷
         xml_lines.append(f'                <PNT A="2" C="{lat:.9f}" D="{lon:.9f}"/>')
 
     xml_lines.append('            </LSG>')
@@ -164,7 +164,6 @@ def export_isoxml(gdf, boundary_geom, output_folder, task_name, rate_col='DOSE')
     xml_lines.append(f'    <TSK A="TSK1" B="{safe_task_name}" C="CTR1" D="FRM1" E="PFD1" G="1">')
     xml_lines.append(f'        <TIM A="{now_str}" B="{now_str}" D="1"/>')
     xml_lines.append('        <DLT A="DFFF" B="31"/>')
-    # 성공했던 :.15f 고정 포맷
     xml_lines.append(
         f'        <GRD G="GRD00000" A="{min_lat:.15f}" B="{min_lon:.15f}" C="{cell_lat_str}" D="{cell_lon_str}" E="{dst_width}" F="{dst_height}" I="2" J="0"/>')
     xml_lines.append('        <TZN A="254" B="Default">')
@@ -180,8 +179,9 @@ def export_isoxml(gdf, boundary_geom, output_folder, task_name, rate_col='DOSE')
     xml_lines.append('    <VPN A="VPN1" B="0" C="1.0" D="2"/>')
     xml_lines.append('</ISO11783_TaskData>')
 
-    # 성공했던 \r\n 바이트 쓰기 방식 복구
+    # [수정] 이 한 줄이 누락되어 추가했습니다!
     xml_path = os.path.join(taskdata_dir, "TASKDATA.XML")
+
     with open(xml_path, 'wb') as f:
         f.write(('\r\n'.join(xml_lines) + '\r\n').encode('utf-8'))
 
@@ -198,6 +198,9 @@ def export_csv(gdf, output_folder, file_prefix):
 
     gdf_wgs['Center_Lat'] = centroids_wgs.y
     gdf_wgs['Center_Lon'] = centroids_wgs.x
+
+    # [핵심 추가] 각 그리드 셀별로 실제로 필요한 비료 총량(kg) 반올림 저장
+    gdf_wgs['Total_Amount_kg'] = gdf_wgs['F_Total'].round(2)
 
     vertex_data = []
     max_v = 0
@@ -218,7 +221,8 @@ def export_csv(gdf, output_folder, file_prefix):
     v_df = pd.DataFrame(vertex_data)
     out_df = gdf_wgs.drop(columns=['geometry']).merge(v_df, left_on='ZONE', right_on='grid_id', how='left')
 
-    base_cols = ['ZONE', 'PRODUCT', 'DOSE', 'DOSE_UNIT', 'Center_Lat', 'Center_Lon']
+    # [핵심 수정] CSV 컬럼에 'Total_Amount_kg' 추가
+    base_cols = ['ZONE', 'PRODUCT', 'DOSE', 'DOSE_UNIT', 'Total_Amount_kg', 'Center_Lat', 'Center_Lon']
     v_cols = []
     for i in range(max_v):
         v_cols.append(f'V{i + 1}_Lat')
@@ -422,6 +426,14 @@ def process_single_field(soil_path, boundary_path, base_name):
             min_n_limit=MIN_N_REQUIREMENT
         )
         final_grid = calculator.execute()
+
+        # ======================================================
+        # [핵심 추가] 계산 완료 직후 필지 전체의 '총 필요 비료량'을 터미널에 요약 출력
+        # ======================================================
+        total_fertilizer_kg = final_grid['F_Total'].sum()
+        print(f"  ----------------------------------------")
+        print(f"  ⭐ [{file_prefix}] 필지 총 필요 비료량: {total_fertilizer_kg:,.2f} kg ⭐")
+        print(f"  ----------------------------------------")
 
         raw_dose = final_grid['F_Need_10a'] * 10
         num_classes = 5
