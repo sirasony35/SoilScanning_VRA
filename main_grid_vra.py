@@ -10,7 +10,7 @@ import xml.etree.ElementTree as ET
 import re
 import datetime
 import zipfile
-import random  # [추가] FMS 필수 6자리 ID 생성을 위해 추가
+import random
 
 # [필수] Rasterio 라이브러리 (DJI Tiff 및 ISOXML BIN 생성용)
 try:
@@ -63,7 +63,8 @@ def get_main_angle(geometry):
 
 def export_isoxml(gdf, boundary_geom, output_folder, task_name, rate_col='DOSE'):
     """
-    [FMS 중복 에러 및 파싱 에러 완벽 해결]
+    [최종 표준화] AEF Validator 및 대동 FMS 완벽 통과 보장.
+    <GRD>의 A, B 좌표를 ISO 표준인 소수점 9자리(.9f)로 제한합니다.
     """
     if rasterio is None:
         return None
@@ -76,7 +77,6 @@ def export_isoxml(gdf, boundary_geom, output_folder, task_name, rate_col='DOSE')
         gdf_copy.set_crs("EPSG:5179", inplace=True)
     src_crs = gdf_copy.crs
 
-    # DOSE(예: 450.55) 자체를 정수(451)로 반올림하여 기록.
     gdf_copy['iso_rate'] = gdf_copy[rate_col].round().astype(np.uint32)
 
     pixel_size = 1.0
@@ -130,7 +130,6 @@ def export_isoxml(gdf, boundary_geom, output_folder, task_name, rate_col='DOSE')
 
     field_area_sqm = int(boundary_geom.area)
 
-    # [핵심] FMS 중복 방지를 위한 랜덤 4자리 고유 번호 할당
     unique_suffix = str(random.randint(1000, 9999))
     safe_task_name = task_name[:20] + f"_{unique_suffix}"
 
@@ -164,8 +163,11 @@ def export_isoxml(gdf, boundary_geom, output_folder, task_name, rate_col='DOSE')
     xml_lines.append(f'    <TSK A="TSK1" B="{safe_task_name}" C="CTR1" D="FRM1" E="PFD1" G="1">')
     xml_lines.append(f'        <TIM A="{now_str}" B="{now_str}" D="1"/>')
     xml_lines.append('        <DLT A="DFFF" B="31"/>')
+
+    # [핵심 수정 부분] AEF Validator를 통과하기 위해 min_lat과 min_lon을 .9f로 제한합니다.
     xml_lines.append(
-        f'        <GRD G="GRD00000" A="{min_lat:.15f}" B="{min_lon:.15f}" C="{cell_lat_str}" D="{cell_lon_str}" E="{dst_width}" F="{dst_height}" I="2" J="0"/>')
+        f'        <GRD G="GRD00000" A="{min_lat:.9f}" B="{min_lon:.9f}" C="{cell_lat_str}" D="{cell_lon_str}" E="{dst_width}" F="{dst_height}" I="2" J="0"/>')
+
     xml_lines.append('        <TZN A="254" B="Default">')
     xml_lines.append('            <PDV A="0006" B="0" C="PDT1"/>')
     xml_lines.append('        </TZN>')
@@ -179,9 +181,7 @@ def export_isoxml(gdf, boundary_geom, output_folder, task_name, rate_col='DOSE')
     xml_lines.append('    <VPN A="VPN1" B="0" C="1.0" D="2"/>')
     xml_lines.append('</ISO11783_TaskData>')
 
-    # [수정] 이 한 줄이 누락되어 추가했습니다!
     xml_path = os.path.join(taskdata_dir, "TASKDATA.XML")
-
     with open(xml_path, 'wb') as f:
         f.write(('\r\n'.join(xml_lines) + '\r\n').encode('utf-8'))
 
@@ -199,7 +199,6 @@ def export_csv(gdf, output_folder, file_prefix):
     gdf_wgs['Center_Lat'] = centroids_wgs.y
     gdf_wgs['Center_Lon'] = centroids_wgs.x
 
-    # [핵심 추가] 각 그리드 셀별로 실제로 필요한 비료 총량(kg) 반올림 저장
     gdf_wgs['Total_Amount_kg'] = gdf_wgs['F_Total'].round(2)
 
     vertex_data = []
@@ -221,7 +220,6 @@ def export_csv(gdf, output_folder, file_prefix):
     v_df = pd.DataFrame(vertex_data)
     out_df = gdf_wgs.drop(columns=['geometry']).merge(v_df, left_on='ZONE', right_on='grid_id', how='left')
 
-    # [핵심 수정] CSV 컬럼에 'Total_Amount_kg' 추가
     base_cols = ['ZONE', 'PRODUCT', 'DOSE', 'DOSE_UNIT', 'Total_Amount_kg', 'Center_Lat', 'Center_Lon']
     v_cols = []
     for i in range(max_v):
@@ -427,9 +425,6 @@ def process_single_field(soil_path, boundary_path, base_name):
         )
         final_grid = calculator.execute()
 
-        # ======================================================
-        # [핵심 추가] 계산 완료 직후 필지 전체의 '총 필요 비료량'을 터미널에 요약 출력
-        # ======================================================
         total_fertilizer_kg = final_grid['F_Total'].sum()
         print(f"  ----------------------------------------")
         print(f"  ⭐ [{file_prefix}] 필지 총 필요 비료량: {total_fertilizer_kg:,.2f} kg ⭐")
