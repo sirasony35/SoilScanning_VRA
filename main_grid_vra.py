@@ -27,7 +27,7 @@ from fertilizer_calculator import FertilizerCalculator
 # ======================================================
 # 0. 환경 설정
 # ======================================================
-DATA_FOLDER = "new_data_0413"
+DATA_FOLDER = "new_data"
 RESULT_ROOT = "result"
 
 CROP_TYPE = 'soybean'
@@ -63,10 +63,12 @@ def get_main_angle(geometry):
 
 def export_isoxml(gdf, boundary_geom, output_folder, task_name, rate_col='DOSE'):
     """
-    [아무것도 인식되지 않는 현상 완벽 해결]
-    1. TASKDATA 자동 ZIP 패키징 (사용자의 수동 압축 오류 원천 차단)
-    2. 한글/공백 제거 및 영문+숫자 강제 변환 (파싱 Crash 방지)
-    3. 성공 파일과 100% 동일한 과학적 지수표기법(E-6) 강제 적용
+    [마스터 버전 - ISO 11783-10 완벽 대응]
+    1. AEF Validator 통과: 소수점 9자리 제한 및 꼬리 0 제거 (str 반올림)
+    2. FMS 호환: Grid 버퍼 2m 추가, 지수표기법(E-6) 강제 고정, 한글 이름 제거
+    3. 기계 호환 (RAUCH 등): TZN J="254" 할당
+    4. 단위 표시 완벽화: DDI 0009 (고체 목표량) 적용 및 VPN(kg/ha) 연결
+    5. 사용자 편의: _TASKDATA.zip 자동 패키징
     """
     if rasterio is None:
         return None
@@ -84,6 +86,7 @@ def export_isoxml(gdf, boundary_geom, output_folder, task_name, rate_col='DOSE')
     pixel_size = 1.0
     minx, miny, maxx, maxy = gdf_copy.total_bounds
 
+    # [FMS 대응] 필지 이탈 오류 방지 (안전 버퍼 2m)
     padding = 2.0
     minx -= padding
     miny -= padding
@@ -134,16 +137,17 @@ def export_isoxml(gdf, boundary_geom, output_folder, task_name, rate_col='DOSE')
     cell_lat = abs(dst_transform.e)
     min_lat = max_lat - (cell_lat * dst_height)
 
-    # [핵심 해결 1] 파이썬의 임의 변환을 막고, 무조건 E-6 지수표기법으로 강제 고정!
+    # [FMS 대응] 파이썬 임의 변환 방지, 무조건 E-6 지수표기법 고정
     cell_lat_str = f"{cell_lat:.15E}".replace('E-0', 'E-').replace('E+0', 'E+')
     cell_lon_str = f"{cell_lon:.15E}".replace('E-0', 'E-').replace('E+0', 'E+')
 
+    # [AEF 및 FMS 대응] 좌표 소수점 9자리 고정 및 불필요한 꼬리 0 제거
     min_lat_str = str(round(min_lat, 9))
     min_lon_str = str(round(min_lon, 9))
 
     field_area_sqm = int(boundary_geom.area)
 
-    # [핵심 해결 2] 파일명에 한글이 섞여 서버가 터지는 것을 막기 위해 영어/숫자만 추출!
+    # [FMS 대응] 이름 한글 충돌 방지 및 안전한 ID 생성
     clean_task_name = re.sub(r'[^A-Za-z0-9]', '', task_name)[:15]
     if not clean_task_name:
         clean_task_name = "FIELD"
@@ -172,6 +176,7 @@ def export_isoxml(gdf, boundary_geom, output_folder, task_name, rate_col='DOSE')
     xml_lines.append(f'        <PLN A="1" B="{safe_task_name}" C="{field_area_sqm}" E="PLN1">')
     xml_lines.append('            <LSG A="1">')
 
+    # [AEF 대응] PNT 좌표도 소수점 9자리 및 꼬리 0 제거
     for lon, lat in zip(*poly_to_use.exterior.coords.xy):
         xml_lines.append(f'                <PNT A="2" C="{str(round(lat, 9))}" D="{str(round(lon, 9))}"/>')
 
@@ -181,28 +186,32 @@ def export_isoxml(gdf, boundary_geom, output_folder, task_name, rate_col='DOSE')
     xml_lines.append(f'    <TSK A="TSK1" B="{safe_task_name}" C="CTR1" D="FRM1" E="PFD1" G="1">')
     xml_lines.append(f'        <TIM A="{now_str}" B="{now_str}" D="1"/>')
     xml_lines.append('        <DLT A="DFFF" B="31"/>')
+
+    # [살포기 호환] RAUCH 등 변량 작동을 위한 J="254" 연결
     xml_lines.append(
         f'        <GRD G="GRD00000" A="{min_lat_str}" B="{min_lon_str}" C="{cell_lat_str}" D="{cell_lon_str}" E="{dst_width}" F="{dst_height}" I="2" J="254"/>')
+
+    # [단위 표시 완벽화] DDI 0009(고체 목표량) 및 화면 표시(VPN1) 연결
     xml_lines.append('        <TZN A="254" B="Default">')
-    xml_lines.append('            <PDV A="0006" B="0" C="PDT1"/>')
+    xml_lines.append('            <PDV A="0009" B="0" C="PDT1" E="VPN1"/>')
     xml_lines.append('        </TZN>')
     xml_lines.append('        <TZN A="253" B="Out of Field">')
-    xml_lines.append('            <PDV A="0006" B="0" C="PDT1"/>')
+    xml_lines.append('            <PDV A="0009" B="0" C="PDT1" E="VPN1"/>')
     xml_lines.append('        </TZN>')
     xml_lines.append('        <TZN A="0" B="Position Lost">')
-    xml_lines.append('            <PDV A="0006" B="0" C="PDT1"/>')
+    xml_lines.append('            <PDV A="0009" B="0" C="PDT1" E="VPN1"/>')
     xml_lines.append('        </TZN>')
     xml_lines.append('    </TSK>')
-    xml_lines.append('    <VPN A="VPN1" B="0" C="1.0" D="2"/>')
+
+    # [단위 표시 완벽화] VPN1에 단위 "kg/ha" 강제 주입
+    xml_lines.append('    <VPN A="VPN1" B="0" C="1.0" D="0" E="kg/ha"/>')
     xml_lines.append('</ISO11783_TaskData>')
 
     xml_path = os.path.join(taskdata_dir, "TASKDATA.XML")
     with open(xml_path, 'wb') as f:
         f.write(('\r\n'.join(xml_lines) + '\r\n').encode('utf-8'))
 
-    # =========================================================================
-    # [핵심 해결 3] 무조건 인식 성공을 위한 TASKDATA 폴더 자동 ZIP 압축 기능 추가!
-    # =========================================================================
+    # [편의성] TASKDATA 자동 ZIP 패키징 (압축 구조 에러 원천 차단)
     taskdata_zip_path = os.path.join(output_folder, f"{safe_task_name}_TASKDATA.zip")
     with zipfile.ZipFile(taskdata_zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
         zf.write(xml_path, arcname="TASKDATA/TASKDATA.XML")
