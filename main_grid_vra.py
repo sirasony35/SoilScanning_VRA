@@ -63,12 +63,10 @@ def get_main_angle(geometry):
 
 def export_isoxml(gdf, boundary_geom, output_folder, task_name, rate_col='DOSE'):
     """
-    [마스터 버전 - ISO 11783-10 완벽 대응]
-    1. AEF Validator 통과: 소수점 9자리 제한 및 꼬리 0 제거 (str 반올림)
-    2. FMS 호환: Grid 버퍼 2m 추가, 지수표기법(E-6) 강제 고정, 한글 이름 제거
-    3. 기계 호환 (RAUCH 등): TZN J="254" 할당
-    4. 단위 표시 완벽화: DDI 0009 (고체 목표량) 적용 및 VPN(kg/ha) 연결
-    5. 사용자 편의: _TASKDATA.zip 자동 패키징
+    [비료 낭비 방지 및 FMS 호환 통합 버전]
+    1. all_touched=False 적용: 경계선에 걸친 픽셀에서 비료가 밖으로 새나가는 것 방지
+    2. 2m 안전 버퍼(Padding)는 유지: FMS 'XML parsing FAILED' 에러 방지용 (틀 역할)
+    3. 실제 데이터는 필지 내부에만 존재하도록 마스킹 강화
     """
     if rasterio is None:
         return None
@@ -81,12 +79,13 @@ def export_isoxml(gdf, boundary_geom, output_folder, task_name, rate_col='DOSE')
         gdf_copy.set_crs("EPSG:5179", inplace=True)
     src_crs = gdf_copy.crs
 
-    gdf_copy['iso_rate'] = gdf_copy[rate_col].round().astype(np.uint32)
+    # 1 kg/ha = 100 mg/m² 스케일링 적용
+    gdf_copy['iso_rate'] = (gdf_copy[rate_col] * 100).round().astype(np.uint32)
 
-    pixel_size = 1.0
+    pixel_size = 1.0  # 1m 해상도 유지
     minx, miny, maxx, maxy = gdf_copy.total_bounds
 
-    # [FMS 대응] 필지 이탈 오류 방지 (안전 버퍼 2m)
+    # [기술적 필수] 2m 패딩은 '틀'로만 사용 (이 공간의 비료값은 자동으로 0이 됨)
     padding = 2.0
     minx -= padding
     miny -= padding
@@ -97,17 +96,21 @@ def export_isoxml(gdf, boundary_geom, output_folder, task_name, rate_col='DOSE')
     height = int(np.ceil((maxy - miny) / pixel_size))
     src_transform = from_origin(minx, maxy, pixel_size, pixel_size)
 
+    # =========================================================================
+    # [핵심 수정] all_touched=False로 변경하여 경계 밖 살포 방지
+    # =========================================================================
     shapes = ((geom, value) for geom, value in zip(gdf_copy.geometry, gdf_copy['iso_rate']))
     src_array = rasterize(
         shapes,
         out_shape=(height, width),
         transform=src_transform,
-        fill=0,
+        fill=0,  # 필지 밖은 0으로 채움
         default_value=0,
         dtype='uint32',
-        all_touched=True
+        all_touched=False  # [중요] 필지 경계선에 살짝 걸치는 픽셀은 비료 살포 제외
     )
 
+    # 이후 reproject 및 BIN 저장 로직은 기존과 동일...
     dst_crs = 'EPSG:4326'
     dst_transform, dst_width, dst_height = calculate_default_transform(
         src_crs, dst_crs, width, height, left=minx, bottom=miny, right=maxx, top=maxy
@@ -131,23 +134,25 @@ def export_isoxml(gdf, boundary_geom, output_folder, task_name, rate_col='DOSE')
     with open(bin_path, 'wb') as f:
         f.write(bin_array.astype('<i4').tobytes())
 
+    # [이하 XML 생성 및 VPN/DDI 로직은 기존 마스터 코드와 동일하게 유지]
+    # ...
+
     min_lon = dst_transform.c
     max_lat = dst_transform.f
     cell_lon = dst_transform.a
     cell_lat = abs(dst_transform.e)
     min_lat = max_lat - (cell_lat * dst_height)
 
-    # [FMS 대응] 파이썬 임의 변환 방지, 무조건 E-6 지수표기법 고정
+    # 파이썬 임의 변환 방지 및 FMS 호환을 위한 지수표기법 고정
     cell_lat_str = f"{cell_lat:.15E}".replace('E-0', 'E-').replace('E+0', 'E+')
     cell_lon_str = f"{cell_lon:.15E}".replace('E-0', 'E-').replace('E+0', 'E+')
 
-    # [AEF 및 FMS 대응] 좌표 소수점 9자리 고정 및 불필요한 꼬리 0 제거
+    # AEF 호환을 위한 소수점 9자리 고정 (꼬리 0 자동 제거)
     min_lat_str = str(round(min_lat, 9))
     min_lon_str = str(round(min_lon, 9))
 
     field_area_sqm = int(boundary_geom.area)
 
-    # [FMS 대응] 이름 한글 충돌 방지 및 안전한 ID 생성
     clean_task_name = re.sub(r'[^A-Za-z0-9]', '', task_name)[:15]
     if not clean_task_name:
         clean_task_name = "FIELD"
@@ -176,7 +181,6 @@ def export_isoxml(gdf, boundary_geom, output_folder, task_name, rate_col='DOSE')
     xml_lines.append(f'        <PLN A="1" B="{safe_task_name}" C="{field_area_sqm}" E="PLN1">')
     xml_lines.append('            <LSG A="1">')
 
-    # [AEF 대응] PNT 좌표도 소수점 9자리 및 꼬리 0 제거
     for lon, lat in zip(*poly_to_use.exterior.coords.xy):
         xml_lines.append(f'                <PNT A="2" C="{str(round(lat, 9))}" D="{str(round(lon, 9))}"/>')
 
@@ -187,11 +191,13 @@ def export_isoxml(gdf, boundary_geom, output_folder, task_name, rate_col='DOSE')
     xml_lines.append(f'        <TIM A="{now_str}" B="{now_str}" D="1"/>')
     xml_lines.append('        <DLT A="DFFF" B="31"/>')
 
-    # [살포기 호환] RAUCH 등 변량 작동을 위한 J="254" 연결
+    # 기계의 정상 변량 작동을 위한 J="254"
     xml_lines.append(
         f'        <GRD G="GRD00000" A="{min_lat_str}" B="{min_lon_str}" C="{cell_lat_str}" D="{cell_lon_str}" E="{dst_width}" F="{dst_height}" I="2" J="254"/>')
 
-    # [단위 표시 완벽화] DDI 0009(고체 목표량) 및 화면 표시(VPN1) 연결
+    # =========================================================================
+    # [핵심 로직] DDI 0009 설정 및 화면 출력용 VPN1 연동
+    # =========================================================================
     xml_lines.append('        <TZN A="254" B="Default">')
     xml_lines.append('            <PDV A="0009" B="0" C="PDT1" E="VPN1"/>')
     xml_lines.append('        </TZN>')
@@ -203,15 +209,17 @@ def export_isoxml(gdf, boundary_geom, output_folder, task_name, rate_col='DOSE')
     xml_lines.append('        </TZN>')
     xml_lines.append('    </TSK>')
 
-    # [단위 표시 완벽화] VPN1에 단위 "kg/ha" 강제 주입
-    xml_lines.append('    <VPN A="VPN1" B="0" C="1.0" D="0" E="kg/ha"/>')
+    # =========================================================================
+    # [핵심 로직] VPN1 설정: 모니터 화면에는 0.01 곱해서 kg/ha로 표기
+    # (예: BIN의 40000 * 0.01 = 400 kg/ha)
+    # =========================================================================
+    xml_lines.append('    <VPN A="VPN1" B="0" C="0.01" D="0" E="kg/ha"/>')
     xml_lines.append('</ISO11783_TaskData>')
 
     xml_path = os.path.join(taskdata_dir, "TASKDATA.XML")
     with open(xml_path, 'wb') as f:
         f.write(('\r\n'.join(xml_lines) + '\r\n').encode('utf-8'))
 
-    # [편의성] TASKDATA 자동 ZIP 패키징 (압축 구조 에러 원천 차단)
     taskdata_zip_path = os.path.join(output_folder, f"{safe_task_name}_TASKDATA.zip")
     with zipfile.ZipFile(taskdata_zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
         zf.write(xml_path, arcname="TASKDATA/TASKDATA.XML")
