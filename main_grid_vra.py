@@ -63,10 +63,12 @@ def get_main_angle(geometry):
 
 def export_isoxml(gdf, boundary_geom, output_folder, task_name, rate_col='DOSE'):
     """
-    [비료 낭비 방지 및 FMS 호환 통합 버전]
-    1. all_touched=False 적용: 경계선에 걸친 픽셀에서 비료가 밖으로 새나가는 것 방지
-    2. 2m 안전 버퍼(Padding)는 유지: FMS 'XML parsing FAILED' 에러 방지용 (틀 역할)
-    3. 실제 데이터는 필지 내부에만 존재하도록 마스킹 강화
+    [라우치/FJD 장비 완벽 호환 마스터 버전]
+    1. 1:1 매핑 적용: 1 kg/ha = BIN 내 1단위 (장비 인식률 1위 방식)
+    2. VPN 배율 1.0 고정: 디스플레이에서 숫자가 10배 뻥튀기되는 현상 완벽 방지
+    3. all_touched=False: 필지 경계 밖 비료 낭비 원천 차단
+    4. FMS 호환: Grid 버퍼 2m 추가, 지수표기법(E-6) 고정, 영문/숫자 이름 강제
+    5. AEF Validator 통과: 소수점 9자리 제한 및 꼬리 0 제거 (str 반올림)
     """
     if rasterio is None:
         return None
@@ -79,13 +81,16 @@ def export_isoxml(gdf, boundary_geom, output_folder, task_name, rate_col='DOSE')
         gdf_copy.set_crs("EPSG:5179", inplace=True)
     src_crs = gdf_copy.crs
 
-    # 1 kg/ha = 100 mg/m² 스케일링 적용
-    gdf_copy['iso_rate'] = (gdf_copy[rate_col] * 100).round().astype(np.uint32)
+    # =========================================================================
+    # [핵심 로직 1] 1:1 매핑 (1 kg/ha = 1 BIN unit)
+    # 라우치 등 대부분의 디스플레이가 1:1 매핑을 기본으로 처리하므로 100배 곱하기 제거
+    # =========================================================================
+    gdf_copy['iso_rate'] = gdf_copy[rate_col].round().astype(np.uint32)
 
-    pixel_size = 1.0  # 1m 해상도 유지
+    pixel_size = 1.0
     minx, miny, maxx, maxy = gdf_copy.total_bounds
 
-    # [기술적 필수] 2m 패딩은 '틀'로만 사용 (이 공간의 비료값은 자동으로 0이 됨)
+    # [FMS 대응] 필지가 그리드 밖으로 나가는 파싱 에러 방지를 위한 2m 안전 버퍼
     padding = 2.0
     minx -= padding
     miny -= padding
@@ -96,21 +101,18 @@ def export_isoxml(gdf, boundary_geom, output_folder, task_name, rate_col='DOSE')
     height = int(np.ceil((maxy - miny) / pixel_size))
     src_transform = from_origin(minx, maxy, pixel_size, pixel_size)
 
-    # =========================================================================
-    # [핵심 수정] all_touched=False로 변경하여 경계 밖 살포 방지
-    # =========================================================================
+    # [핵심 로직 2] all_touched=False 적용하여 경계선 밖 비료 살포 방지
     shapes = ((geom, value) for geom, value in zip(gdf_copy.geometry, gdf_copy['iso_rate']))
     src_array = rasterize(
         shapes,
         out_shape=(height, width),
         transform=src_transform,
-        fill=0,  # 필지 밖은 0으로 채움
+        fill=0,
         default_value=0,
         dtype='uint32',
-        all_touched=False  # [중요] 필지 경계선에 살짝 걸치는 픽셀은 비료 살포 제외
+        all_touched=False
     )
 
-    # 이후 reproject 및 BIN 저장 로직은 기존과 동일...
     dst_crs = 'EPSG:4326'
     dst_transform, dst_width, dst_height = calculate_default_transform(
         src_crs, dst_crs, width, height, left=minx, bottom=miny, right=maxx, top=maxy
@@ -133,9 +135,6 @@ def export_isoxml(gdf, boundary_geom, output_folder, task_name, rate_col='DOSE')
     bin_path = os.path.join(taskdata_dir, "GRD00000.bin")
     with open(bin_path, 'wb') as f:
         f.write(bin_array.astype('<i4').tobytes())
-
-    # [이하 XML 생성 및 VPN/DDI 로직은 기존 마스터 코드와 동일하게 유지]
-    # ...
 
     min_lon = dst_transform.c
     max_lat = dst_transform.f
@@ -195,9 +194,6 @@ def export_isoxml(gdf, boundary_geom, output_folder, task_name, rate_col='DOSE')
     xml_lines.append(
         f'        <GRD G="GRD00000" A="{min_lat_str}" B="{min_lon_str}" C="{cell_lat_str}" D="{cell_lon_str}" E="{dst_width}" F="{dst_height}" I="2" J="254"/>')
 
-    # =========================================================================
-    # [핵심 로직] DDI 0009 설정 및 화면 출력용 VPN1 연동
-    # =========================================================================
     xml_lines.append('        <TZN A="254" B="Default">')
     xml_lines.append('            <PDV A="0009" B="0" C="PDT1" E="VPN1"/>')
     xml_lines.append('        </TZN>')
@@ -210,10 +206,10 @@ def export_isoxml(gdf, boundary_geom, output_folder, task_name, rate_col='DOSE')
     xml_lines.append('    </TSK>')
 
     # =========================================================================
-    # [핵심 로직] VPN1 설정: 모니터 화면에는 0.01 곱해서 kg/ha로 표기
-    # (예: BIN의 40000 * 0.01 = 400 kg/ha)
+    # [핵심 로직 3] VPN1 배율을 1.0으로 복구
+    # (BIN에 저장된 405라는 값을 화면에도 뻥튀기 없이 그대로 405 kg/ha 로 표기)
     # =========================================================================
-    xml_lines.append('    <VPN A="VPN1" B="0" C="0.01" D="0" E="kg/ha"/>')
+    xml_lines.append('    <VPN A="VPN1" B="0" C="1.0" D="0" E="kg/ha"/>')
     xml_lines.append('</ISO11783_TaskData>')
 
     xml_path = os.path.join(taskdata_dir, "TASKDATA.XML")
