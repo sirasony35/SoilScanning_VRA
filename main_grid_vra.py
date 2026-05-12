@@ -27,8 +27,8 @@ from fertilizer_calculator import FertilizerCalculator
 # ======================================================
 # 0. 환경 설정
 # ======================================================
-DATA_FOLDER = "new_data_0416"
-RESULT_ROOT = "result"
+DATA_FOLDER = "new_data0514"
+RESULT_ROOT = "result_0514"
 
 CROP_TYPE = 'soybean'
 TARGET_YIELD = 500
@@ -39,7 +39,7 @@ MIN_N_REQUIREMENT = 2.0
 FERTILIZER_N_CONTENT = 0.20
 FERTILIZER_BAG_WEIGHT = 20
 
-GRID_SIZES = [20]
+GRID_SIZES = [32]
 
 
 # ======================================================
