@@ -27,19 +27,22 @@ from fertilizer_calculator import FertilizerCalculator
 # ======================================================
 # 0. 환경 설정
 # ======================================================
-DATA_FOLDER = "new_data_0515"
-RESULT_ROOT = "result_0515"
+DATA_FOLDER = "real_data"
+RESULT_ROOT = "result_real"
 
 CROP_TYPE = 'soybean'
 TARGET_YIELD = 500
 BASAL_RATIO = 100
-SOIL_TEXTURE = '식양질'
+SOIL_TEXTURE = '사양질'
 MIN_N_REQUIREMENT = 2.0
 
-FERTILIZER_N_CONTENT = 0.20
+FERTILIZER_N_CONTENT = 0.08
 FERTILIZER_BAG_WEIGHT = 20
 
-GRID_SIZES = [20,32]
+GRID_SIZES = [32]
+
+# 🌟 [신규 기능] 혼합 살포할 토양 살균제(또는 기타 약제) 총량 설정 (kg)
+FUNGICIDE_TOTAL_KG = 120
 
 
 # ======================================================
@@ -63,12 +66,11 @@ def get_main_angle(geometry):
 
 def export_isoxml(gdf, boundary_geom, output_folder, task_name, rate_col='DOSE'):
     """
-    [라우치/FJD 장비 완벽 호환 마스터 버전]
-    1. 1:1 매핑 적용: 1 kg/ha = BIN 내 1단위 (장비 인식률 1위 방식)
-    2. VPN 배율 1.0 고정: 디스플레이에서 숫자가 10배 뻥튀기되는 현상 완벽 방지
-    3. all_touched=False: 필지 경계 밖 비료 낭비 원천 차단
-    4. FMS 호환: Grid 버퍼 2m 추가, 지수표기법(E-6) 고정, 영문/숫자 이름 강제
-    5. AEF Validator 통과: 소수점 9자리 제한 및 꼬리 0 제거 (str 반올림)
+    [라우치 완벽 호환 및 ISOXML 마스터 규격]
+    1. 1:1 매핑 적용 (1 kg/ha = BIN 내 1단위)
+    2. VPN 배율 1.0 고정
+    3. all_touched=False (경계선 밖 비료 낭비 방지)
+    4. 2m 안전 버퍼 및 좌표계 소수점 9자리 고정 등 FMS 에러 원천 차단
     """
     if rasterio is None:
         return None
@@ -81,16 +83,13 @@ def export_isoxml(gdf, boundary_geom, output_folder, task_name, rate_col='DOSE')
         gdf_copy.set_crs("EPSG:5179", inplace=True)
     src_crs = gdf_copy.crs
 
-    # =========================================================================
-    # [핵심 로직 1] 1:1 매핑 (1 kg/ha = 1 BIN unit)
-    # 라우치 등 대부분의 디스플레이가 1:1 매핑을 기본으로 처리하므로 100배 곱하기 제거
-    # =========================================================================
+    # 1:1 매핑 (라우치 장비 디스플레이 최적화)
     gdf_copy['iso_rate'] = gdf_copy[rate_col].round().astype(np.uint32)
 
     pixel_size = 1.0
     minx, miny, maxx, maxy = gdf_copy.total_bounds
 
-    # [FMS 대응] 필지가 그리드 밖으로 나가는 파싱 에러 방지를 위한 2m 안전 버퍼
+    # 2m 안전 버퍼 (FMS 파싱 에러 방지용 프레임)
     padding = 2.0
     minx -= padding
     miny -= padding
@@ -101,7 +100,7 @@ def export_isoxml(gdf, boundary_geom, output_folder, task_name, rate_col='DOSE')
     height = int(np.ceil((maxy - miny) / pixel_size))
     src_transform = from_origin(minx, maxy, pixel_size, pixel_size)
 
-    # [핵심 로직 2] all_touched=False 적용하여 경계선 밖 비료 살포 방지
+    # 필지 경계 밖 낭비 방지 마스킹
     shapes = ((geom, value) for geom, value in zip(gdf_copy.geometry, gdf_copy['iso_rate']))
     src_array = rasterize(
         shapes,
@@ -142,11 +141,8 @@ def export_isoxml(gdf, boundary_geom, output_folder, task_name, rate_col='DOSE')
     cell_lat = abs(dst_transform.e)
     min_lat = max_lat - (cell_lat * dst_height)
 
-    # 파이썬 임의 변환 방지 및 FMS 호환을 위한 지수표기법 고정
     cell_lat_str = f"{cell_lat:.15E}".replace('E-0', 'E-').replace('E+0', 'E+')
     cell_lon_str = f"{cell_lon:.15E}".replace('E-0', 'E-').replace('E+0', 'E+')
-
-    # AEF 호환을 위한 소수점 9자리 고정 (꼬리 0 자동 제거)
     min_lat_str = str(round(min_lat, 9))
     min_lon_str = str(round(min_lon, 9))
 
@@ -190,7 +186,6 @@ def export_isoxml(gdf, boundary_geom, output_folder, task_name, rate_col='DOSE')
     xml_lines.append(f'        <TIM A="{now_str}" B="{now_str}" D="1"/>')
     xml_lines.append('        <DLT A="DFFF" B="31"/>')
 
-    # 기계의 정상 변량 작동을 위한 J="254"
     xml_lines.append(
         f'        <GRD G="GRD00000" A="{min_lat_str}" B="{min_lon_str}" C="{cell_lat_str}" D="{cell_lon_str}" E="{dst_width}" F="{dst_height}" I="2" J="254"/>')
 
@@ -205,10 +200,6 @@ def export_isoxml(gdf, boundary_geom, output_folder, task_name, rate_col='DOSE')
     xml_lines.append('        </TZN>')
     xml_lines.append('    </TSK>')
 
-    # =========================================================================
-    # [핵심 로직 3] VPN1 배율을 1.0으로 복구
-    # (BIN에 저장된 405라는 값을 화면에도 뻥튀기 없이 그대로 405 kg/ha 로 표기)
-    # =========================================================================
     xml_lines.append('    <VPN A="VPN1" B="0" C="1.0" D="0" E="kg/ha"/>')
     xml_lines.append('</ISO11783_TaskData>')
 
@@ -461,24 +452,43 @@ def process_single_field(soil_path, boundary_path, base_name):
         )
         final_grid = calculator.execute()
 
+        # =========================================================================
+        # 🌟 [신규 로직] 토양 살균제 혼합 비례 상향 연산
+        # =========================================================================
         total_fertilizer_kg = final_grid['F_Total'].sum()
+
         print(f"  ----------------------------------------")
-        print(f"  ⭐ [{file_prefix}] 필지 총 필요 비료량: {total_fertilizer_kg:,.2f} kg ⭐")
+        print(f"  ⭐ [{file_prefix}] 필지 총 순수 비료 요구량: {total_fertilizer_kg:,.2f} kg")
+
+        if total_fertilizer_kg > 0 and FUNGICIDE_TOTAL_KG > 0:
+            mix_ratio = FUNGICIDE_TOTAL_KG / total_fertilizer_kg
+            total_mixed_kg = total_fertilizer_kg + FUNGICIDE_TOTAL_KG
+            print(f"  💊 살균제 {FUNGICIDE_TOTAL_KG}kg 혼합 적용 완료 (비례 증가율: +{mix_ratio * 100:.2f}%)")
+            print(f"  🚜 최종 실제 살포 총량(비료+살균제): {total_mixed_kg:,.2f} kg ⭐")
+        else:
+            mix_ratio = 0.0
+
         print(f"  ----------------------------------------")
 
+        # 기존 순수 비료 요구량(10a 단위)을 ha 단위로 바꾸고, 혼합 증가율 적용
         raw_dose = final_grid['F_Need_10a'] * 10
-        num_classes = 5
-        unique_vals = raw_dose.nunique()
+        mixed_dose = raw_dose * (1 + mix_ratio)  # 살균제 무게만큼 처방량 뻥튀기
 
+        num_classes = 5
+        unique_vals = mixed_dose.nunique()
+
+        # 이후 로직은 상향된 mixed_dose를 기준으로 등급(PRODUCT) 및 처방(DOSE) 산출
         if unique_vals > num_classes:
-            _, bins = pd.cut(raw_dose, bins=num_classes, retbins=True, duplicates='drop')
+            _, bins = pd.cut(mixed_dose, bins=num_classes, retbins=True, duplicates='drop')
             labels = [(bins[i] + bins[i + 1]) / 2 for i in range(len(bins) - 1)]
             product_labels = list(range(1, len(labels) + 1))
 
-            final_grid['DOSE'] = pd.cut(raw_dose, bins=bins, labels=labels, include_lowest=True).astype(float).round(2)
-            final_grid['PRODUCT'] = pd.cut(raw_dose, bins=bins, labels=product_labels, include_lowest=True).astype(int)
+            final_grid['DOSE'] = pd.cut(mixed_dose, bins=bins, labels=labels, include_lowest=True).astype(float).round(
+                2)
+            final_grid['PRODUCT'] = pd.cut(mixed_dose, bins=bins, labels=product_labels, include_lowest=True).astype(
+                int)
         else:
-            final_grid['DOSE'] = raw_dose.round(2)
+            final_grid['DOSE'] = mixed_dose.round(2)
             final_grid['PRODUCT'] = final_grid['DOSE'].rank(method='dense').astype(int)
 
         final_grid['ZONE'] = final_grid['grid_id']
@@ -532,6 +542,7 @@ def main():
     print(f"==========================================")
     print(f" 설정: {CROP_TYPE}, 토성: {SOIL_TEXTURE}")
     print(f" 최소시비량: {MIN_N_REQUIREMENT}kg/10a")
+    print(f" 살균제 혼합: {FUNGICIDE_TOTAL_KG}kg")
     print(f" 다중 해상도 맵 생성: {GRID_SIZES}m")
     print(f"==========================================")
 
