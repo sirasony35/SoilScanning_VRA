@@ -27,22 +27,22 @@ from fertilizer_calculator import FertilizerCalculator
 # ======================================================
 # 0. 환경 설정
 # ======================================================
-DATA_FOLDER = "real_data"
-RESULT_ROOT = "result_real"
+DATA_FOLDER = "hs_data_0528/SoiOptix 맵핑 데이터"
+RESULT_ROOT = "result_hs_0528"
 
-CROP_TYPE = 'soybean'
-TARGET_YIELD = 500
-BASAL_RATIO = 100
-SOIL_TEXTURE = '사양질'
+CROP_TYPE = 'rice'
+TARGET_YIELD = 480
+BASAL_RATIO = 56
+SOIL_TEXTURE = '식양질'
 MIN_N_REQUIREMENT = 2.0
 
-FERTILIZER_N_CONTENT = 0.08
+FERTILIZER_N_CONTENT = 0.28
 FERTILIZER_BAG_WEIGHT = 20
 
-GRID_SIZES = [32]
+GRID_SIZES = [10]
 
 # 🌟 [신규 기능] 혼합 살포할 토양 살균제(또는 기타 약제) 총량 설정 (kg)
-FUNGICIDE_TOTAL_KG = 120
+FUNGICIDE_TOTAL_KG = 0
 
 
 # ======================================================

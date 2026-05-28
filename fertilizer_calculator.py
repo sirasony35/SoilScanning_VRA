@@ -24,7 +24,7 @@ class FertilizerCalculator:
 
     def _find_column(self, candidates):
         for col in self.gdf.columns:
-            # 🚨 [추가] 지형 데이터 컬럼(geometry)은 'OM'이 포함되어 있어도 무조건 건너뜀
+            # 🚨 지형 데이터 컬럼(geometry)은 'OM'이 포함되어 있어도 무조건 건너뜀
             if col.upper() == 'GEOMETRY':
                 continue
 
@@ -46,20 +46,40 @@ class FertilizerCalculator:
         si_series = self.gdf[self.si_col].fillna(0)
 
         print("  ----------------------------------------")
-        print(f"  🌱 [시비량 산출 엔진 가동] 작물: {self.crop_type.upper()} / 토성: {self.soil_texture}")
+        print(f"  🌱 [시비량 산출 엔진 가동] 작물: {self.crop_type.upper()} / 목표 수량: {self.target_yield}kg")
 
+        # ==========================================
+        # 🌾 [수정됨] 벼 (Rice) 시비 처방 로직
+        # ==========================================
         if self.crop_type == 'rice':
-            if self.soil_texture in ['사질', '사양질', 'sandy', 'sandyloam']:
-                n_calc = 9.14 - (0.109 * om_series) + (0.020 * si_series)
-                n_calc = n_calc.clip(upper=13)
-                print("  💡 [적용 공식] 벼 (사질/사양질) : 순수 질소(N) = 9.14 - (0.109 × 유기물) + (0.020 × 유효규산)")
-            else:
-                n_calc = 7.10 - (0.085 * om_series) + (0.016 * si_series)
-                print("  💡 [적용 공식] 벼 (일반/식양질) : 순수 질소(N) = 7.10 - (0.085 × 유기물) + (0.016 × 유효규산)")
+            # 유효규산(SI)이 180을 넘어가면 180으로 고정
+            si_capped = si_series.clip(upper=180)
+
+            if self.target_yield >= 500:
+                n_calc = 11.17 - (0.1333 * om_series) + (0.0025 * si_capped)
+                n_calc = n_calc.clip(upper=15)  # 질소 최고 15kg 상한
+                print(f"  💡 [적용 공식] 벼 (목표 {self.target_yield}kg) : 순수 질소(N) = 11.17 - (0.1333 × 유기물) + (0.0025 × 유효규산)")
+                print("  ⚠️ [제한 적용] 유효규산 최대 180 고정 / 질소량 최고 15kg 제한 적용")
+
+            elif self.target_yield >= 480:
+                n_calc = 9.14 - (0.109 * om_series) + (0.020 * si_capped)
+                n_calc = n_calc.clip(upper=13)  # 질소 최고 13kg 상한
+                print(f"  💡 [적용 공식] 벼 (목표 {self.target_yield}kg) : 순수 질소(N) = 9.14 - (0.109 × 유기물) + (0.020 × 유효규산)")
+                print("  ⚠️ [제한 적용] 유효규산 최대 180 고정 / 질소량 최고 13kg 제한 적용")
+
+            else:  # 460 이하
+                n_calc = 7.10 - (0.085 * om_series) + (0.016 * si_capped)
+                n_calc = n_calc.clip(upper=11)  # 질소 최고 11kg 상한
+                print(f"  💡 [적용 공식] 벼 (목표 {self.target_yield}kg) : 순수 질소(N) = 7.10 - (0.085 × 유기물) + (0.016 × 유효규산)")
+                print("  ⚠️ [제한 적용] 유효규산 최대 180 고정 / 질소량 최고 11kg 제한 적용")
 
             self.gdf['N_Total_Need_10a'] = n_calc.clip(lower=0)
 
+        # ==========================================
+        # 🫘 논콩 (Soybean) 시비 처방 로직
+        # ==========================================
         elif self.crop_type == 'soybean':
+            print(f"  🌱 [조건 확인] 논콩 토성: {self.soil_texture}")
             if self.soil_texture in ['사질', '사양질', 'sandy', 'sandyloam']:
                 n_calc = 8.178 - (0.232 * om_series)
                 print("  💡 [적용 공식] 논콩 (사질/사양질) : 순수 질소(N) = 8.178 - (0.232 × 유기물)")
@@ -69,6 +89,9 @@ class FertilizerCalculator:
 
             self.gdf['N_Total_Need_10a'] = n_calc.clip(lower=0)
 
+        # ==========================================
+        # 🌾 밀 (Wheat) 및 기타
+        # ==========================================
         elif self.crop_type == 'wheat':
             print("  💡 [적용 공식] 밀 : N = 기본 시비량 적용 (현재 0으로 세팅됨)")
             self.gdf['N_Total_Need_10a'] = 0
