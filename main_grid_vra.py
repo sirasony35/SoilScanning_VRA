@@ -27,19 +27,19 @@ from fertilizer_calculator import FertilizerCalculator
 # ======================================================
 # 0. 환경 설정
 # ======================================================
-DATA_FOLDER = "hs_data_0528/SoiOptix 맵핑 데이터"
-RESULT_ROOT = "result_hs_0528"
+DATA_FOLDER = "gj_data_0528/김제 SoilOptix 맵핑 데이터"
+RESULT_ROOT = "result_gj_0528"
 
 CROP_TYPE = 'rice'
 TARGET_YIELD = 480
-BASAL_RATIO = 56
+BASAL_RATIO = 70
 SOIL_TEXTURE = '식양질'
 MIN_N_REQUIREMENT = 2.0
 
-FERTILIZER_N_CONTENT = 0.28
+FERTILIZER_N_CONTENT = 0.3
 FERTILIZER_BAG_WEIGHT = 20
 
-GRID_SIZES = [10]
+GRID_SIZES = [5,10]
 
 # 🌟 [신규 기능] 혼합 살포할 토양 살균제(또는 기타 약제) 총량 설정 (kg)
 FUNGICIDE_TOTAL_KG = 0
