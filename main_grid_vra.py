@@ -27,22 +27,38 @@ from fertilizer_calculator import FertilizerCalculator
 # ======================================================
 # 0. 환경 설정
 # ======================================================
-DATA_FOLDER = "gj_data_0528/김제 SoilOptix 맵핑 데이터"
-RESULT_ROOT = "result_gj_0528"
+DATA_FOLDER = "real_data"
+RESULT_ROOT = "result_gjsm_0601"
 
-CROP_TYPE = 'rice'
+CROP_TYPE = 'soybean'
 TARGET_YIELD = 480
-BASAL_RATIO = 70
-SOIL_TEXTURE = '식양질'
+BASAL_RATIO = 100
+SOIL_TEXTURE = '사질'
 MIN_N_REQUIREMENT = 2.0
 
-FERTILIZER_N_CONTENT = 0.3
+FERTILIZER_N_CONTENT = 0.08
 FERTILIZER_BAG_WEIGHT = 20
 
-GRID_SIZES = [5,10]
+GRID_SIZES = [32]
 
-# 🌟 [신규 기능] 혼합 살포할 토양 살균제(또는 기타 약제) 총량 설정 (kg)
-FUNGICIDE_TOTAL_KG = 0
+# 🌟 [기능 1] 필지별 강제 목표 비료량 (kg) 매핑 사전
+FIELD_TARGET_KG = {
+    "SM-1-1": 1514,
+    "SM-1-2": 1514,
+    "SM-1-3": 1514,
+    "SM-2-2": 1353,
+    "SM-2-3": 1303
+}
+
+# 🌟 [기능 2] 필지별 토양살균제 추가량 (kg) 매핑 사전
+# (사전에 없으면 기본 0kg으로 처리됨)
+FIELD_FUNGICIDE_KG = {
+    "SM-1-1": 120,
+    "SM-1-2": 120,
+    "SM-1-3": 120,
+    "SM-2-2": 120,
+    "SM-2-3": 120
+}
 
 
 # ======================================================
@@ -65,13 +81,6 @@ def get_main_angle(geometry):
 
 
 def export_isoxml(gdf, boundary_geom, output_folder, task_name, rate_col='DOSE'):
-    """
-    [라우치 완벽 호환 및 ISOXML 마스터 규격]
-    1. 1:1 매핑 적용 (1 kg/ha = BIN 내 1단위)
-    2. VPN 배율 1.0 고정
-    3. all_touched=False (경계선 밖 비료 낭비 방지)
-    4. 2m 안전 버퍼 및 좌표계 소수점 9자리 고정 등 FMS 에러 원천 차단
-    """
     if rasterio is None:
         return None
 
@@ -89,7 +98,6 @@ def export_isoxml(gdf, boundary_geom, output_folder, task_name, rate_col='DOSE')
     pixel_size = 1.0
     minx, miny, maxx, maxy = gdf_copy.total_bounds
 
-    # 2m 안전 버퍼 (FMS 파싱 에러 방지용 프레임)
     padding = 2.0
     minx -= padding
     miny -= padding
@@ -100,7 +108,6 @@ def export_isoxml(gdf, boundary_geom, output_folder, task_name, rate_col='DOSE')
     height = int(np.ceil((maxy - miny) / pixel_size))
     src_transform = from_origin(minx, maxy, pixel_size, pixel_size)
 
-    # 필지 경계 밖 낭비 방지 마스킹
     shapes = ((geom, value) for geom, value in zip(gdf_copy.geometry, gdf_copy['iso_rate']))
     src_array = rasterize(
         shapes,
@@ -453,31 +460,47 @@ def process_single_field(soil_path, boundary_path, base_name):
         final_grid = calculator.execute()
 
         # =========================================================================
-        # 🌟 [신규 로직] 토양 살균제 혼합 비례 상향 연산
+        # 🌟 [신규 로직] 필지별 목표 비료량 + 살균제 동시 비례 스케일링
         # =========================================================================
         total_fertilizer_kg = final_grid['F_Total'].sum()
 
         print(f"  ----------------------------------------")
-        print(f"  ⭐ [{file_prefix}] 필지 총 순수 비료 요구량: {total_fertilizer_kg:,.2f} kg")
+        print(f"  ⭐ [{file_prefix}] 시스템 순수 산출 비료량: {total_fertilizer_kg:,.2f} kg")
 
-        if total_fertilizer_kg > 0 and FUNGICIDE_TOTAL_KG > 0:
-            mix_ratio = FUNGICIDE_TOTAL_KG / total_fertilizer_kg
-            total_mixed_kg = total_fertilizer_kg + FUNGICIDE_TOTAL_KG
-            print(f"  💊 살균제 {FUNGICIDE_TOTAL_KG}kg 혼합 적용 완료 (비례 증가율: +{mix_ratio * 100:.2f}%)")
-            print(f"  🚜 최종 실제 살포 총량(비료+살균제): {total_mixed_kg:,.2f} kg ⭐")
+        # 딕셔너리에서 값 불러오기
+        target_kg = FIELD_TARGET_KG.get(base_name, 0)
+        fungicide_kg = FIELD_FUNGICIDE_KG.get(base_name, 0)
+
+        # 1. 엑셀 강제 보정량이 있으면 적용, 없으면 원래 시스템 산출량 사용
+        base_fert_kg = target_kg if target_kg > 0 else total_fertilizer_kg
+
+        # 2. 살균제 추가량을 더하여 최종 물리적 살포 총량 결정
+        total_mixed_kg = base_fert_kg + fungicide_kg
+
+        # 3. 원래 시스템 산출량 대비 최종 살포량의 스케일링 비율 계산
+        if total_fertilizer_kg > 0:
+            mix_ratio = total_mixed_kg / total_fertilizer_kg
         else:
-            mix_ratio = 0.0
+            mix_ratio = 1.0
 
+        if target_kg > 0:
+            print(f"  🎯 [목표량 강제 보정] 엑셀 지정량 {target_kg}kg 적용")
+        if fungicide_kg > 0:
+            print(f"  💊 [살균제 추가] {fungicide_kg}kg 혼합 적용")
+
+        print(f"  🚜 최종 실제 살포 총량(비료+살균제): {total_mixed_kg:,.2f} kg ⭐ (비례 증가율: {mix_ratio * 100:.2f}%)")
         print(f"  ----------------------------------------")
 
-        # 기존 순수 비료 요구량(10a 단위)을 ha 단위로 바꾸고, 혼합 증가율 적용
+        # 기존 순수 비료 요구량(10a 단위)을 ha 단위로 바꾸고, 최종 스케일링 비율 곱하기
         raw_dose = final_grid['F_Need_10a'] * 10
-        mixed_dose = raw_dose * (1 + mix_ratio)  # 살균제 무게만큼 처방량 뻥튀기
+        mixed_dose = raw_dose * mix_ratio
+
+        # 🚨 [중요 추가] CSV 및 SHP 파일에도 스케일링된 총 무게가 정확히 찍히도록 F_Total 갱신
+        final_grid['F_Total'] = final_grid['F_Total'] * mix_ratio
 
         num_classes = 5
         unique_vals = mixed_dose.nunique()
 
-        # 이후 로직은 상향된 mixed_dose를 기준으로 등급(PRODUCT) 및 처방(DOSE) 산출
         if unique_vals > num_classes:
             _, bins = pd.cut(mixed_dose, bins=num_classes, retbins=True, duplicates='drop')
             labels = [(bins[i] + bins[i + 1]) / 2 for i in range(len(bins) - 1)]
@@ -542,7 +565,8 @@ def main():
     print(f"==========================================")
     print(f" 설정: {CROP_TYPE}, 토성: {SOIL_TEXTURE}")
     print(f" 최소시비량: {MIN_N_REQUIREMENT}kg/10a")
-    print(f" 살균제 혼합: {FUNGICIDE_TOTAL_KG}kg")
+    if FIELD_TARGET_KG or FIELD_FUNGICIDE_KG:
+        print(f" 🎯 [알림] 엑셀 기반 필지별 목표량 및 살균제 스케일링 활성화됨")
     print(f" 다중 해상도 맵 생성: {GRID_SIZES}m")
     print(f"==========================================")
 
