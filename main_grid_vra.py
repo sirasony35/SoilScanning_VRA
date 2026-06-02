@@ -28,7 +28,7 @@ from fertilizer_calculator import FertilizerCalculator
 # 0. 환경 설정
 # ======================================================
 DATA_FOLDER = "real_data"
-RESULT_ROOT = "result_gjsm_0601"
+RESULT_ROOT = "result_gjsm_0602"
 
 CROP_TYPE = 'soybean'
 TARGET_YIELD = 480
@@ -43,11 +43,11 @@ GRID_SIZES = [32]
 
 # 🌟 [기능 1] 필지별 강제 목표 비료량 (kg) 매핑 사전
 FIELD_TARGET_KG = {
-    "SM-1-1": 1514,
-    "SM-1-2": 1514,
-    "SM-1-3": 1514,
-    "SM-2-2": 1353,
-    "SM-2-3": 1303
+    "SM-1-1": 1500,
+    "SM-1-2": 1500,
+    "SM-1-3": 1500,
+    "SM-2-2": 1360,
+    "SM-2-3": 1340
 }
 
 # 🌟 [기능 2] 필지별 토양살균제 추가량 (kg) 매핑 사전
