@@ -28,7 +28,7 @@ from fertilizer_calculator import FertilizerCalculator
 # 0. 환경 설정
 # ======================================================
 DATA_FOLDER = "real_data"
-RESULT_ROOT = "result_gjsm_0602"
+RESULT_ROOT = "result_gjsm_0613"
 
 CROP_TYPE = 'soybean'
 TARGET_YIELD = 480
@@ -92,8 +92,9 @@ def export_isoxml(gdf, boundary_geom, output_folder, task_name, rate_col='DOSE')
         gdf_copy.set_crs("EPSG:5179", inplace=True)
     src_crs = gdf_copy.crs
 
-    # 1:1 매핑 (라우치 장비 디스플레이 최적화)
-    gdf_copy['iso_rate'] = gdf_copy[rate_col].round().astype(np.uint32)
+    # ISO 11783-11 Mass-per-Area DDI 기본 단위는 mg/m² (1 kg/ha = 100 mg/m²)
+    # → kg/ha 값을 mg/m²로 저장하기 위해 ×100. VPN(C="0.01")이 표시 시 다시 kg/ha로 환산.
+    gdf_copy['iso_rate'] = (gdf_copy[rate_col] * 100).round().astype(np.uint32)
 
     pixel_size = 1.0
     minx, miny, maxx, maxy = gdf_copy.total_bounds
@@ -207,7 +208,7 @@ def export_isoxml(gdf, boundary_geom, output_folder, task_name, rate_col='DOSE')
     xml_lines.append('        </TZN>')
     xml_lines.append('    </TSK>')
 
-    xml_lines.append('    <VPN A="VPN1" B="0" C="1.0" D="0" E="kg/ha"/>')
+    xml_lines.append('    <VPN A="VPN1" B="0" C="0.01" D="2" E="kg/ha"/>')
     xml_lines.append('</ISO11783_TaskData>')
 
     xml_path = os.path.join(taskdata_dir, "TASKDATA.XML")
