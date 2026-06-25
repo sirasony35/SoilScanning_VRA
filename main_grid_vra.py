@@ -28,7 +28,7 @@ from fertilizer_calculator import FertilizerCalculator
 # 0. 환경 설정
 # ======================================================
 DATA_FOLDER = "real_data"
-RESULT_ROOT = "result_gjsm_0613"
+RESULT_ROOT = "result_gjsm_0625"
 
 CROP_TYPE = 'soybean'
 TARGET_YIELD = 480
@@ -40,6 +40,12 @@ FERTILIZER_N_CONTENT = 0.08
 FERTILIZER_BAG_WEIGHT = 20
 
 GRID_SIZES = [32]
+
+# 🌟 ISOXML 출력 포맷 선택
+EXPORT_ISOXML_GRD = True    # 정북형 격자 (래스터 .bin) - FMS/트랙터에서 정상 동작
+EXPORT_ISOXML_TZN = False   # 폴리곤 TZN - FMS(FieldFusion) 미지원으로 기본 비활성화
+                            # (다른 ISOXML 호환 소프트웨어 테스트 시에만 True)
+TZN_MERGE_ADJACENT = True   # TZN 활성화 시 동일 처방량 인접 셀 union 여부
 
 # 🌟 [기능 1] 필지별 강제 목표 비료량 (kg) 매핑 사전
 FIELD_TARGET_KG = {
@@ -219,6 +225,139 @@ def export_isoxml(gdf, boundary_geom, output_folder, task_name, rate_col='DOSE')
     with zipfile.ZipFile(taskdata_zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
         zf.write(xml_path, arcname="TASKDATA/TASKDATA.XML")
         zf.write(bin_path, arcname="TASKDATA/GRD00000.bin")
+
+    return taskdata_zip_path
+
+
+def export_isoxml_tzn(gdf, boundary_geom, output_folder, task_name,
+                      rate_col='DOSE', merge_adjacent=True):
+    """
+    Polygon TZN(Treatment Zone) 형식의 ISOXML 처방맵 생성.
+    GRD 래스터 방식과 달리 회전된 셀 폴리곤 형상을 그대로 보존 →
+    계단형 외곽 문제 없음, .bin 파일 불필요.
+    """
+    from shapely.ops import unary_union
+
+    taskdata_dir = os.path.join(output_folder, "TASKDATA_TZN")
+    os.makedirs(taskdata_dir, exist_ok=True)
+
+    gdf_copy = gdf.copy()
+    if gdf_copy.crs is None:
+        gdf_copy.set_crs("EPSG:5179", inplace=True)
+
+    # WGS84 변환
+    gdf_wgs = gdf_copy.to_crs("EPSG:4326")
+
+    # ISO 11783-11 Mass-per-Area DDI 기본 단위(mg/m²) 환산: kg/ha × 100
+    # → VPN C="0.01"로 표시 시 다시 kg/ha 환원 (GRD와 동일 규약)
+    gdf_wgs['iso_rate'] = (gdf_wgs[rate_col] * 100).round().astype(int)
+
+    # 필지 경계 WGS84
+    boundary_wgs = gpd.GeoSeries([boundary_geom], crs="EPSG:5179").to_crs("EPSG:4326").iloc[0]
+    if boundary_wgs.geom_type == 'MultiPolygon':
+        poly_to_use = max(boundary_wgs.geoms, key=lambda a: a.area)
+    elif boundary_wgs.geom_type == 'Polygon':
+        poly_to_use = boundary_wgs
+    else:
+        poly_to_use = boundary_wgs.convex_hull
+
+    # 동일 처방량 셀들 그룹핑 → 각 rate별로 폴리곤 목록 작성
+    zones = []  # [(rate_int, [polygon, ...]), ...]
+    for rate, group in gdf_wgs.groupby('iso_rate'):
+        polys = []
+        if merge_adjacent:
+            # 인접한 동일 rate 셀 → 하나의 폴리곤으로 union
+            merged = unary_union(group.geometry.tolist())
+            if merged is None or merged.is_empty:
+                continue
+            if merged.geom_type == 'Polygon':
+                polys = [merged]
+            elif merged.geom_type == 'MultiPolygon':
+                polys = list(merged.geoms)
+        else:
+            for geom in group.geometry:
+                if geom is None or geom.is_empty:
+                    continue
+                if geom.geom_type == 'Polygon':
+                    polys.append(geom)
+                elif geom.geom_type == 'MultiPolygon':
+                    polys.extend(list(geom.geoms))
+        if polys:
+            zones.append((int(rate), polys))
+
+    if not zones:
+        print("    - [TZN] 유효한 처방 zone이 없어 생성을 건너뜁니다.")
+        return None
+
+    # 메타데이터
+    field_area_sqm = int(boundary_geom.area)
+    clean_task_name = re.sub(r'[^A-Za-z0-9]', '', task_name)[:14]
+    if not clean_task_name:
+        clean_task_name = "FIELD"
+    unique_suffix = str(random.randint(1000, 9999))
+    safe_task_name = f"{clean_task_name}T{unique_suffix}"
+    now_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    # XML 생성
+    xml_lines = []
+    xml_lines.append(
+        '<ISO11783_TaskData VersionMinor="0" VersionMajor="4" DataTransferOrigin="1" ManagementSoftwareManufacturer="FMS" TaskControllerManufacturer="FMS" ManagementSoftwareVersion="2.1.6">')
+    xml_lines.append('    <CTR A="CTR1" B="daedong"/>')
+    xml_lines.append('    <FRM A="FRM1" B="daedong"/>')
+    xml_lines.append('    <PDT A="PDT1" B="Fertilizer"/>')
+
+    # 필지 경계 (PFD > PLN A=1)
+    xml_lines.append(
+        f'    <PFD A="PFD1" B="{unique_suffix}" C="{safe_task_name}" D="{field_area_sqm}" E="CTR1" F="FRM1">')
+    xml_lines.append(f'        <PLN A="1" B="{safe_task_name}" C="{field_area_sqm}" E="PLN1">')
+    xml_lines.append('            <LSG A="1">')
+    for lon, lat in zip(*poly_to_use.exterior.coords.xy):
+        xml_lines.append(f'                <PNT A="2" C="{round(lat, 9)}" D="{round(lon, 9)}"/>')
+    xml_lines.append('            </LSG>')
+    xml_lines.append('        </PLN>')
+    xml_lines.append('    </PFD>')
+
+    # 작업 (TSK)
+    xml_lines.append(f'    <TSK A="TSK1" B="{safe_task_name}" C="CTR1" D="FRM1" E="PFD1" G="1">')
+    xml_lines.append(f'        <TIM A="{now_str}" B="{now_str}" D="1"/>')
+    xml_lines.append('        <DLT A="DFFF" B="31"/>')
+
+    # 각 처방량별 TZN 폴리곤 생성 (GRD 없이 TZN만 사용)
+    for tzn_id, (rate, polys) in enumerate(zones, start=1):
+        rate_kgha = rate / 100.0
+        color_idx = (tzn_id - 1) % 16  # ISO color index 0~15
+        xml_lines.append(
+            f'        <TZN A="{tzn_id}" B="Rate_{rate_kgha:.0f}kgha" C="{color_idx}">')
+        xml_lines.append(f'            <PDV A="0009" B="{rate}" C="PDT1" E="VPN1"/>')
+        for poly_idx, poly in enumerate(polys, start=1):
+            xml_lines.append(f'            <PLN A="2" B="Z{tzn_id}_{poly_idx}">')
+            # 외곽 (LSG A="1")
+            xml_lines.append('                <LSG A="1">')
+            for lon, lat in zip(*poly.exterior.coords.xy):
+                xml_lines.append(
+                    f'                    <PNT A="2" C="{round(lat, 9)}" D="{round(lon, 9)}"/>')
+            xml_lines.append('                </LSG>')
+            # 내부 구멍 (LSG A="2") - 있을 경우만
+            for interior in poly.interiors:
+                xml_lines.append('                <LSG A="2">')
+                for lon, lat in zip(*interior.coords.xy):
+                    xml_lines.append(
+                        f'                    <PNT A="2" C="{round(lat, 9)}" D="{round(lon, 9)}"/>')
+                xml_lines.append('                </LSG>')
+            xml_lines.append('            </PLN>')
+        xml_lines.append('        </TZN>')
+
+    xml_lines.append('    </TSK>')
+    xml_lines.append('    <VPN A="VPN1" B="0" C="0.01" D="2" E="kg/ha"/>')
+    xml_lines.append('</ISO11783_TaskData>')
+
+    xml_path = os.path.join(taskdata_dir, "TASKDATA.XML")
+    with open(xml_path, 'wb') as f:
+        f.write(('\r\n'.join(xml_lines) + '\r\n').encode('utf-8'))
+
+    taskdata_zip_path = os.path.join(output_folder, f"{safe_task_name}_TASKDATA_TZN.zip")
+    with zipfile.ZipFile(taskdata_zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+        zf.write(xml_path, arcname="TASKDATA/TASKDATA.XML")
 
     return taskdata_zip_path
 
@@ -536,12 +675,24 @@ def process_single_field(soil_path, boundary_path, base_name):
         export_csv(final_grid, grid_result_dir, file_prefix)
         export_dji_tif(final_grid, grid_result_dir, file_prefix, rate_col='DOSE')
 
-        try:
-            zip_out = export_isoxml(final_grid, boundary_geom, grid_result_dir, task_name=file_prefix, rate_col='DOSE')
-            if zip_out:
-                print(f"    - ISOXML(TASKDATA) ZIP 자동 생성 완료: {os.path.basename(zip_out)}")
-        except Exception as e:
-            print(f"    - ISOXML 생성 오류: {e}")
+        if EXPORT_ISOXML_GRD:
+            try:
+                zip_out = export_isoxml(final_grid, boundary_geom, grid_result_dir,
+                                        task_name=file_prefix, rate_col='DOSE')
+                if zip_out:
+                    print(f"    - ISOXML GRD(래스터) ZIP 생성: {os.path.basename(zip_out)}")
+            except Exception as e:
+                print(f"    - ISOXML GRD 생성 오류: {e}")
+
+        if EXPORT_ISOXML_TZN:
+            try:
+                zip_out = export_isoxml_tzn(final_grid, boundary_geom, grid_result_dir,
+                                            task_name=file_prefix, rate_col='DOSE',
+                                            merge_adjacent=TZN_MERGE_ADJACENT)
+                if zip_out:
+                    print(f"    - ISOXML TZN(폴리곤) ZIP 생성: {os.path.basename(zip_out)}")
+            except Exception as e:
+                print(f"    - ISOXML TZN 생성 오류: {e}")
 
 
 def find_matching_boundary(soil_file, all_boundary_files):
