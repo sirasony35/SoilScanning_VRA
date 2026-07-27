@@ -47,6 +47,11 @@ EXPORT_ISOXML_TZN = False   # 폴리곤 TZN - FMS(FieldFusion) 미지원으로 �
                             # (다른 ISOXML 호환 소프트웨어 테스트 시에만 True)
 TZN_MERGE_ADJACENT = True   # TZN 활성화 시 동일 처방량 인접 셀 union 여부
 
+# 🌟 결측 셀(토양 포인트 없는 그리드) 처리 방식 (IDW 보간)
+NAN_FILL_METHOD = 'idw'     # 'idw' | 'zero'  ('zero'면 기존 fillna(0) 동작)
+IDW_K = 5                   # IDW 최근접 이웃 셀 개수
+IDW_POWER = 2               # 거리 역가중 지수 (2 = 역제곱, 통상값)
+
 # 🌟 [기능 1] 필지별 강제 목표 비료량 (kg) 매핑 사전
 FIELD_TARGET_KG = {
     "SM-1-1": 1500,
@@ -70,6 +75,71 @@ FIELD_FUNGICIDE_KG = {
 # ======================================================
 # 1. 공통 함수 정의
 # ======================================================
+
+def fill_nan_by_idw(gdf, cols, k=5, power=2):
+    """
+    포인트가 없는 그리드 셀(NaN)을 최근접 K개 유효 셀의 IDW(거리 역가중 평균)로 채움.
+    작물별 핵심 컬럼(콩=OM, 벼=OM+SI)에만 적용해서 결측 셀이 최대 처방으로 튀는 문제 방지.
+
+    Args:
+        gdf: GeoDataFrame (폴리곤 셀들)
+        cols: 채울 컬럼 이름 리스트 (예: ['OM'] 또는 ['OM','SI'])
+        k: 최근접 이웃 셀 수 (유효 셀이 k보다 적으면 자동 축소)
+        power: 거리 역가중 지수 (2 = 역제곱, IDW 통상값)
+
+    Returns:
+        수정된 gdf. 처리 결과는 console에도 출력.
+    """
+    from scipy.spatial import cKDTree
+
+    if gdf.geometry.is_empty.any() or gdf.geometry.isna().any():
+        gdf = gdf[~(gdf.geometry.isna() | gdf.geometry.is_empty)].copy()
+
+    centroids = np.array([[g.centroid.x, g.centroid.y] for g in gdf.geometry])
+
+    for col in cols:
+        if col not in gdf.columns:
+            continue
+        vals = gdf[col].values.astype(float).copy()
+        valid_mask = ~np.isnan(vals)
+        invalid_mask = ~valid_mask
+        n_valid = int(valid_mask.sum())
+        n_invalid = int(invalid_mask.sum())
+
+        if n_invalid == 0:
+            print(f"    - [IDW] {col}: 결측 셀 없음 (전체 {len(vals)}개 모두 측정값 존재)")
+            continue
+        if n_valid == 0:
+            print(f"    - [IDW] {col}: ⚠️ 유효 셀 없음 → 채움 불가 (안전망 fillna(0) 예정)")
+            continue
+
+        k_use = min(k, n_valid)
+        tree = cKDTree(centroids[valid_mask])
+        distances, indices = tree.query(centroids[invalid_mask], k=k_use)
+
+        # k=1인 경우 반환 shape을 (n,1)로 통일
+        if k_use == 1:
+            distances = distances.reshape(-1, 1)
+            indices = indices.reshape(-1, 1)
+
+        # 거리 0 방지용 아주 작은 epsilon
+        eps = 1e-12
+        weights = 1.0 / (distances ** power + eps)
+        weights_norm = weights / weights.sum(axis=1, keepdims=True)
+
+        neighbor_vals = vals[valid_mask][indices]  # (n_invalid, k_use)
+        filled = (weights_norm * neighbor_vals).sum(axis=1)
+
+        vals[invalid_mask] = filled
+        gdf[col] = vals
+
+        vmin = filled.min() if len(filled) > 0 else 0.0
+        vmax = filled.max() if len(filled) > 0 else 0.0
+        print(f"    - [IDW] {col}: 결측 {n_invalid}/{len(vals)} 셀 채움 "
+              f"(k={k_use}, power={power}, 채운값 범위 {vmin:.2f}~{vmax:.2f})")
+
+    return gdf
+
 
 def get_main_angle(geometry):
     rect = geometry.minimum_rotated_rectangle
@@ -586,6 +656,21 @@ def process_single_field(soil_path, boundary_path, base_name):
         final_grid = clipped_grid.merge(grid_stats, on='grid_id', how='left')
         if final_grid.crs is None:
             final_grid.set_crs(clipped_grid.crs, inplace=True)
+
+        # 🌟 [결측 셀 처리] 토양 포인트가 없는 그리드는 주변 셀 IDW로 채움
+        # (계획대로 콩=OM, 벼=OM+SI 핵심 컬럼 우선)
+        if NAN_FILL_METHOD == 'idw':
+            critical_cols = ['OM']
+            if CROP_TYPE == 'rice':
+                critical_cols.append('SI')
+            critical_cols = [c for c in critical_cols if c in final_grid.columns]
+
+            if critical_cols:
+                print(f"  🌐 [결측 셀 보간] IDW (k={IDW_K}, power={IDW_POWER}), 대상 컬럼: {critical_cols}")
+                final_grid = fill_nan_by_idw(final_grid, critical_cols,
+                                             k=IDW_K, power=IDW_POWER)
+
+        # 안전망: 나머지 (또는 IDW 실패한) 결측은 0으로 채움
         final_grid[analysis_cols] = final_grid[analysis_cols].fillna(0)
 
         calculator = FertilizerCalculator(
