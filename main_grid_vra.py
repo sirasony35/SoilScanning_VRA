@@ -156,7 +156,15 @@ def get_main_angle(geometry):
     return main_angle
 
 
-def export_isoxml(gdf, boundary_geom, output_folder, task_name, rate_col='DOSE'):
+def export_isoxml(gdf, boundary_geom, output_folder, task_name, rate_col='DOSE',
+                  raw_scale=100.0, vpn_scale="0.01"):
+    """
+    raw_scale : .bin 저장값 = DOSE(kg/ha) × raw_scale
+    vpn_scale : VPN C 속성 (FMS 표시 = raw × C)
+    기본값(100, "0.01")은 기존 SM 프로덕션과 동일.
+    ※ 단말기(대동)는 raw ÷ (C×100)으로 표시하는 것이 실측됨(2026-08-27) —
+      FMS·단말기 양쪽 kg/ha 표시가 필요하면 raw_scale=10, vpn_scale="0.1" 사용.
+    """
     if rasterio is None:
         return None
 
@@ -168,9 +176,8 @@ def export_isoxml(gdf, boundary_geom, output_folder, task_name, rate_col='DOSE')
         gdf_copy.set_crs("EPSG:5179", inplace=True)
     src_crs = gdf_copy.crs
 
-    # ISO 11783-11 Mass-per-Area DDI 기본 단위는 mg/m² (1 kg/ha = 100 mg/m²)
-    # → kg/ha 값을 mg/m²로 저장하기 위해 ×100. VPN(C="0.01")이 표시 시 다시 kg/ha로 환산.
-    gdf_copy['iso_rate'] = (gdf_copy[rate_col] * 100).round().astype(np.uint32)
+    # .bin 저장값 = kg/ha × raw_scale (기본 100 = mg/m², ISO 11783-11 Mass-per-Area)
+    gdf_copy['iso_rate'] = (gdf_copy[rate_col] * raw_scale).round().astype(np.uint32)
 
     pixel_size = 1.0
     minx, miny, maxx, maxy = gdf_copy.total_bounds
@@ -284,7 +291,7 @@ def export_isoxml(gdf, boundary_geom, output_folder, task_name, rate_col='DOSE')
     xml_lines.append('        </TZN>')
     xml_lines.append('    </TSK>')
 
-    xml_lines.append('    <VPN A="VPN1" B="0" C="0.01" D="2" E="kg/ha"/>')
+    xml_lines.append(f'    <VPN A="VPN1" B="0" C="{vpn_scale}" D="2" E="kg/ha"/>')
     xml_lines.append('</ISO11783_TaskData>')
 
     xml_path = os.path.join(taskdata_dir, "TASKDATA.XML")

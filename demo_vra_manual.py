@@ -27,7 +27,7 @@ import main_grid_vra as M
 # ======================================================
 # 0. 환경 설정
 # ======================================================
-BOUNDARY_PATH = r"test_data/간척지_비료시연.zip"   # 경계 폴리곤 (zip/shp)
+BOUNDARY_PATH = r"data/demo/간척지_비료시연.zip"   # 경계 폴리곤 (zip/shp)
 RESULT_ROOT = "result_demo"
 BASE_NAME = "간척지_비료시연"
 TASK_NAME_ASCII = "GANCHEOKDEMO"      # ISOXML TSK 이름(영문/숫자만 유효)
@@ -51,6 +51,19 @@ EXPORT_ISOXML = True
 EXPORT_SHP = True
 EXPORT_CSV = True
 EXPORT_DJI = True
+
+# ISOXML 스케일 변형 — (접미사, raw_scale, VPN C)
+# 실측 확정(2026-08-27, 네 사례 교차검증):
+#   FMS 표시 = raw × C
+#   단말기 표시는 FMS→단말기 전송 경로에 따라 다름:
+#     · 자동 전송(단말기 항목명 TZN_...)   : raw ÷ 100
+#     · 이름 지정 전송(항목명 = 지정 이름) : raw 그대로 (×1)
+# 경로별 정답 조합:
+#   C안: raw=kg/ha×100, C=0.01 → 자동 전송(TZN_) 경로용
+#   D안: raw=kg/ha×1,   C=1.0  → 이름 지정 전송 경로용 (현재 사용 중인 방식)
+ISOXML_VARIANTS = [
+    ('D', 1.0, '1.0'),
+]
 
 
 # ======================================================
@@ -188,10 +201,14 @@ def export_all(grid, boundary_gdf, boundary_geom, out_dir, file_prefix):
         M.export_dji_tif(grid.copy(), out_dir, file_prefix, rate_col='DOSE')
 
     if EXPORT_ISOXML:
-        zip_out = M.export_isoxml(grid.copy(), boundary_geom, out_dir,
-                                  task_name=TASK_NAME_ASCII, rate_col='DOSE')
-        if zip_out:
-            print(f"    - ISOXML GRD ZIP 생성: {os.path.basename(zip_out)}")
+        for suffix, raw_scale, vpn_c in ISOXML_VARIANTS:
+            zip_out = M.export_isoxml(grid.copy(), boundary_geom, out_dir,
+                                      task_name=f"{TASK_NAME_ASCII}{suffix}",
+                                      rate_col='DOSE',
+                                      raw_scale=raw_scale, vpn_scale=vpn_c)
+            if zip_out:
+                print(f"    - ISOXML GRD ZIP ({suffix}안, raw×{raw_scale:g}, C={vpn_c}): "
+                      f"{os.path.basename(zip_out)}")
 
 
 # ======================================================
