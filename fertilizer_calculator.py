@@ -56,9 +56,9 @@ class FertilizerCalculator:
             si_capped = si_series.clip(upper=180)
 
             if self.target_yield >= 500:
-                n_calc = 11.17 - (0.1333 * om_series) + (0.0025 * si_capped)
+                n_calc = 11.17 - (0.133 * om_series) + (0.025 * si_capped)
                 n_calc = n_calc.clip(upper=15)  # 질소 최고 15kg 상한
-                print(f"  💡 [적용 공식] 벼 (목표 {self.target_yield}kg) : 순수 질소(N) = 11.17 - (0.1333 × 유기물) + (0.0025 × 유효규산)")
+                print(f"  💡 [적용 공식] 벼 (목표 {self.target_yield}kg) : 순수 질소(N) = 11.17 - (0.133 × 유기물) + (0.025 × 유효규산)")
                 print("  ⚠️ [제한 적용] 유효규산 최대 180 고정 / 질소량 최고 15kg 제한 적용")
 
             elif self.target_yield >= 480:
